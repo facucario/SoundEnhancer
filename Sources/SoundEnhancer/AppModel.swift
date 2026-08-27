@@ -13,6 +13,12 @@ final class AppModel: ObservableObject {
     @Published var trebleDb: Double = 3.5
     @Published var spatial: Double = 12.5
 
+    @Published var xtcEnabled: Bool = false
+    @Published var xtcGeometry: XTCGeometry = .macBook
+    @Published var xtcIntensity: Double = 0.8
+    @Published var customSeparation: Double = 0.60
+    @Published var customDistance: Double = 0.80
+
     @Published var outputDevices: [AudioDevice] = []
     @Published var selectedOutputDeviceID: AudioDeviceID = 0
     @Published var inputDeviceName: String?
@@ -91,6 +97,20 @@ final class AppModel: ObservableObject {
         syncEngine()
     }
 
+    func applyXTC() {
+        engine.setXTCEnabled(xtcEnabled)
+        let (s, d) = xtcGeometryValues()
+        engine.setXTCGeometry(separation: s, distance: d)
+        engine.setXTCIntensity(Float(xtcIntensity))
+    }
+
+    private func xtcGeometryValues() -> (separation: Double, distance: Double) {
+        if xtcGeometry == .custom {
+            return (customSeparation, customDistance)
+        }
+        return (xtcGeometry.separation, xtcGeometry.distance)
+    }
+
     func applyBufferSize() {
         syncEngine()
     }
@@ -166,6 +186,7 @@ final class AppModel: ObservableObject {
             activeOutputID = outputID
             activeBufferSize = bufferSize
             applyDSP()
+            applyXTC()
             updateStatus()
         } catch {
             statusText = "Audio engine error: \(error.localizedDescription)"

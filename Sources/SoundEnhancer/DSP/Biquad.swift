@@ -76,6 +76,22 @@ struct Biquad {
         return b
     }
 
+    static func highPass(sampleRate: Double, frequency: Double, q: Double = 0.707) -> Biquad {
+        let w0 = 2.0 * Double.pi * frequency / sampleRate
+        let cosw = cos(w0)
+        let alpha = sin(w0) / (2.0 * q)
+        let a0 = 1 + alpha
+        let k = (1 + cosw) / 2
+
+        var b = Biquad()
+        b.b0 = Float(k / a0)
+        b.b1 = Float(-2 * k / a0)
+        b.b2 = Float(k / a0)
+        b.a1 = Float(-2 * cosw / a0)
+        b.a2 = Float((1 - alpha) / a0)
+        return b
+    }
+
     static func lowPass(sampleRate: Double, frequency: Double, q: Double = 0.707) -> Biquad {
         let w0 = 2.0 * Double.pi * frequency / sampleRate
         let cosw = cos(w0)

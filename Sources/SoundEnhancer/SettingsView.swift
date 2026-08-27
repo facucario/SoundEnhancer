@@ -61,6 +61,50 @@ struct SettingsView: View {
                 Text("Enhancer")
             }
 
+            Section("Crosstalk Cancellation (XTC)") {
+                Toggle("Enable XTC", isOn: $model.xtcEnabled)
+                    .onChange(of: model.xtcEnabled) { _, _ in model.applyXTC() }
+
+                if model.xtcEnabled {
+                    Picker("Speaker Setup", selection: $model.xtcGeometry) {
+                        ForEach(XTCGeometry.allCases) { geometry in
+                            Text(geometry.displayName).tag(geometry)
+                        }
+                    }
+                    .onChange(of: model.xtcGeometry) { _, _ in model.applyXTC() }
+
+                    if model.xtcGeometry == .custom {
+                        LabeledContent("Speaker separation") {
+                            Text(String(format: "%.2f m", model.customSeparation))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $model.customSeparation, in: 0.1...3.0)
+                            .onChange(of: model.customSeparation) { _, _ in model.applyXTC() }
+
+                        LabeledContent("Listener distance") {
+                            Text(String(format: "%.2f m", model.customDistance))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $model.customDistance, in: 0.1...3.0)
+                            .onChange(of: model.customDistance) { _, _ in model.applyXTC() }
+                    }
+
+                    LabeledContent("Cancellation") {
+                        Text("\(Int(model.xtcIntensity * 100))%")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $model.xtcIntensity, in: 0...1)
+                        .onChange(of: model.xtcIntensity) { _, _ in model.applyXTC() }
+
+                    Text("Cancels acoustic crosstalk between speakers to preserve binaural spatial cues over loudspeakers. Choose the setup that matches your speaker geometry.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
             Section("Latency") {
                 Picker("Buffer Size", selection: $model.bufferSize) {
                     Text("128 frames").tag(128)

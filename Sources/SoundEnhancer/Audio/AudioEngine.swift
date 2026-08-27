@@ -24,6 +24,7 @@ final class AudioEngine {
     static let maxFramesPerSlice: Int = 4096
 
     let dsp = SoundEnhancerDSP()
+    let xtc = CrosstalkCancellationDSP()
 
     private(set) var inputDeviceID: AudioDeviceID?
     private(set) var outputDeviceID: AudioDeviceID?
@@ -89,6 +90,7 @@ final class AudioEngine {
         outputUnit = nil
         isRunning = false
         dsp.reset()
+        xtc.reset()
     }
 
     func setIntensity(_ value: Float) {
@@ -97,6 +99,18 @@ final class AudioEngine {
 
     func setParameters(width: Float, bassDb: Float, trebleDb: Float, spatialMix: Float) {
         dsp.setParameters(width: width, bassDb: bassDb, trebleDb: trebleDb, spatialMix: spatialMix)
+    }
+
+    func setXTCEnabled(_ enabled: Bool) {
+        xtc.setEnabled(enabled)
+    }
+
+    func setXTCGeometry(separation: Double, distance: Double) {
+        xtc.setGeometry(separation: separation, distance: distance)
+    }
+
+    func setXTCIntensity(_ value: Float) {
+        xtc.setIntensity(value)
     }
 
     // MARK: - Configuration
@@ -108,6 +122,7 @@ final class AudioEngine {
         sampleRate = AudioDeviceManager.device(id: outID)?.nominalSampleRate ?? 48000
         if sampleRate <= 0 { sampleRate = 48000 }
         dsp.setSampleRate(sampleRate)
+        xtc.setSampleRate(sampleRate)
 
         AudioDeviceManager.setBufferFrameSize(inID, frames: bufferSize)
         AudioDeviceManager.setBufferFrameSize(outID, frames: bufferSize)
@@ -247,6 +262,7 @@ final class AudioEngine {
         inputLevel = peak
 
         dsp.process(left: inputLeft, right: inputRight, frameCount: n)
+        xtc.process(left: inputLeft, right: inputRight, frameCount: n)
 
         for i in 0..<n {
             scratch[i * 2] = inputLeft[i]
