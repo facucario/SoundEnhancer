@@ -44,19 +44,19 @@ final class SoundEnhancerDSP {
         let a = min(max(value, 0), 1)
         intensity = a
         setParameters(
-            width: Float(1.0 + 1.2 * Double(a)),
-            bassDb: Float(6.0 * Double(a)),
-            trebleDb: Float(7.0 * Double(a)),
-            spatialMix: Float(0.25 * Double(a)))
+            width: Float(1.0 + 2.0 * Double(a)),
+            bassDb: Float(10.0 * Double(a)),
+            trebleDb: Float(10.0 * Double(a)),
+            spatialMix: Float(0.35 * Double(a)))
     }
 
     func setParameters(width: Float, bassDb: Float, trebleDb: Float, spatialMix: Float) {
-        widthGain = min(max(width, 1.0), 2.2)
-        bassGainDb = min(max(bassDb, 0), 6.0)
-        trebleGainDb = min(max(trebleDb, 0), 7.0)
-        haasMix = min(max(spatialMix, 0), 0.25)
+        widthGain = min(max(width, 1.0), 3.0)
+        bassGainDb = min(max(bassDb, 0), 10.0)
+        trebleGainDb = min(max(trebleDb, 0), 10.0)
+        haasMix = min(max(spatialMix, 0), 0.35)
 
-        let normalized = haasMix / 0.25
+        let normalized = haasMix / 0.35
         let delaySeconds = Self.minDelaySeconds + (Self.maxDelaySeconds - Self.minDelaySeconds) * Double(normalized)
         haasDelaySamples = Float(delaySeconds * sampleRate)
 
@@ -82,8 +82,8 @@ final class SoundEnhancerDSP {
     }
 
     private func recomputeFilters() {
-        let enhance = min(max((bassGainDb / 6.0 + trebleGainDb / 7.0 + haasMix / 0.25) / 3.0, 0), 1)
-        let midGain = -1.0 * Double(enhance)
+        let enhance = min(max((bassGainDb / 10.0 + trebleGainDb / 10.0 + haasMix / 0.35) / 3.0, 0), 1)
+        let midGain = -2.0 * Double(enhance)
 
         lowShelfL = .lowShelf(sampleRate: sampleRate, frequency: 80, gainDb: Double(bassGainDb))
         lowShelfR = lowShelfL

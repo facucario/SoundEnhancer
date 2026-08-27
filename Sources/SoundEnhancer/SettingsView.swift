@@ -16,7 +16,7 @@ struct SettingsView: View {
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
-                        Slider(value: $model.width, in: 1.0...2.2)
+                        Slider(value: $model.width, in: 1.0...3.0)
                             .onChange(of: model.width) { _, _ in model.applyDSP() }
 
                         LabeledContent("Bass Boost") {
@@ -24,7 +24,7 @@ struct SettingsView: View {
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
-                        Slider(value: $model.bassDb, in: 0...6)
+                        Slider(value: $model.bassDb, in: 0...10)
                             .onChange(of: model.bassDb) { _, _ in model.applyDSP() }
 
                         LabeledContent("Treble Boost") {
@@ -32,7 +32,7 @@ struct SettingsView: View {
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
-                        Slider(value: $model.trebleDb, in: 0...7)
+                        Slider(value: $model.trebleDb, in: 0...10)
                             .onChange(of: model.trebleDb) { _, _ in model.applyDSP() }
 
                         LabeledContent("Spatial Depth") {
@@ -40,7 +40,7 @@ struct SettingsView: View {
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
-                        Slider(value: $model.spatial, in: 0...25)
+                        Slider(value: $model.spatial, in: 0...35)
                             .onChange(of: model.spatial) { _, _ in model.applyDSP() }
                     }
                 } else {

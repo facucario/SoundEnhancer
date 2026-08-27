@@ -79,10 +79,10 @@ final class AppModel: ObservableObject {
         } else {
             let a = intensity
             engine.setParameters(
-                width: Float(1.0 + 1.2 * a),
-                bassDb: Float(6.0 * a),
-                trebleDb: Float(7.0 * a),
-                spatialMix: Float(0.25 * a))
+                width: Float(1.0 + 2.0 * a),
+                bassDb: Float(10.0 * a),
+                trebleDb: Float(10.0 * a),
+                spatialMix: Float(0.35 * a))
         }
     }
 
