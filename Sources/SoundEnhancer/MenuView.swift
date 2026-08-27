@@ -21,13 +21,17 @@ struct MenuView: View {
 
             Divider()
 
-            if let input = model.inputDeviceName {
-                Label("Input: \(input)", systemImage: "arrow.down.circle")
-                    .font(.caption)
-            } else {
-                Label("Virtual input not found", systemImage: "exclamationmark.triangle")
+            if model.needsDriverInstall {
+                Label("Driver not installed", systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundColor(.orange)
+            } else if let source = model.captureSourceText {
+                Label("Capture: \(source)", systemImage: "arrow.down.circle")
+                    .font(.caption)
+            } else {
+                Label("Starting…", systemImage: "pause.circle")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
 
             Text(model.statusText)

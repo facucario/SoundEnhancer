@@ -36,10 +36,63 @@ enum AudioDeviceManager {
         audioObjectID(selector: kAudioHardwarePropertyDefaultInputDevice)
     }
 
-    static func blackHoleInputDevice() -> AudioDevice? {
-        inputDevices().first {
-            $0.name.lowercased().contains("blackhole") || $0.uid.lowercased().contains("blackhole")
+    static func virtualDevice() -> AudioDevice? {
+        allDevices().first {
+            $0.uid.lowercased().contains("soundenhancer") || $0.name.lowercased().contains("soundenhancer")
         }
+    }
+
+    static func setDefaultOutputDevice(_ id: AudioDeviceID) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var value = id
+        _ = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &value)
+    }
+
+    static func setVolume(_ id: AudioDeviceID, scalar: Float32) {
+        for scope in [kAudioObjectPropertyScopeOutput, kAudioObjectPropertyScopeInput] {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: scope,
+                mElement: kAudioObjectPropertyElementMain)
+            var value = scalar
+            _ = AudioObjectSetPropertyData(id, &address, 0, nil, UInt32(MemoryLayout<Float32>.size), &value)
+        }
+    }
+
+    static func setMuted(_ id: AudioDeviceID, _ muted: Bool) {
+        for scope in [kAudioObjectPropertyScopeOutput, kAudioObjectPropertyScopeInput] {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
+                mScope: scope,
+                mElement: kAudioObjectPropertyElementMain)
+            var value: UInt32 = muted ? 1 : 0
+            _ = AudioObjectSetPropertyData(id, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
+        }
+    }
+
+    static func volumeDecibels(_ id: AudioDeviceID) -> Float {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeDecibels,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        var value: Float32 = 0.0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr else { return 0.0 }
+        return value
+    }
+
+    static func isMuted(_ id: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr else { return false }
+        return value != 0
     }
 
     static func device(id: AudioDeviceID) -> AudioDevice? {

@@ -1,10 +1,13 @@
 APP := SoundEnhancer.app
 PREFIX ?= $(HOME)/Applications
 
-.PHONY: build app install run test clean
+.PHONY: build app driver install run test clean
 
 build:
 	swift build -c release
+
+driver:
+	./Scripts/build-driver.sh
 
 app: build
 	./Scripts/build-app.sh
@@ -22,4 +25,4 @@ test:
 
 clean:
 	swift package clean
-	rm -rf "$(APP)"
+	rm -rf "$(APP)" SoundEnhancerDriver.driver

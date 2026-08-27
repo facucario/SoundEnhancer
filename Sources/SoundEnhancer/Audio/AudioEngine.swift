@@ -36,8 +36,10 @@ final class AudioEngine {
 
     private var inputUnit: AudioUnit?
     private var outputUnit: AudioUnit?
+    private var masterGain: Float = 1.0
+    private var inputFramesLogged: UInt64 = 0
 
-    private let ringBuffer = RingBuffer(capacity: 1 << 15)
+    private let ringBuffer = RingBuffer(capacity: 1 << 17)
 
     private let inputLeft: UnsafeMutablePointer<Float>
     private let inputRight: UnsafeMutablePointer<Float>
@@ -111,6 +113,10 @@ final class AudioEngine {
 
     func setXTCIntensity(_ value: Float) {
         xtc.setIntensity(value)
+    }
+
+    func setMasterGain(_ value: Float) {
+        masterGain = min(max(value, 0.0), 1.0)
     }
 
     // MARK: - Configuration
@@ -260,6 +266,11 @@ final class AudioEngine {
             let b = abs(inputRight[i]); if b > peak { peak = b }
         }
         inputLevel = peak
+        inputFramesLogged += UInt64(n)
+        if inputFramesLogged >= UInt64(sampleRate) * 5 {
+            AudioLog.write("input level=\(peak) (frames \(n))")
+            inputFramesLogged = 0
+        }
 
         dsp.process(left: inputLeft, right: inputRight, frameCount: n)
         xtc.process(left: inputLeft, right: inputRight, frameCount: n)
@@ -288,9 +299,10 @@ final class AudioEngine {
         let right = buffers[1].mData?.assumingMemoryBound(to: Float.self)
         guard let l = left, let r = right else { return noErr }
         var peak: Float = 0
+        let gain = masterGain
         for i in 0..<n {
-            l[i] = scratch[i * 2]
-            r[i] = scratch[i * 2 + 1]
+            l[i] = scratch[i * 2] * gain
+            r[i] = scratch[i * 2 + 1] * gain
             let a = abs(l[i]); if a > peak { peak = a }
         }
         outputLevel = peak

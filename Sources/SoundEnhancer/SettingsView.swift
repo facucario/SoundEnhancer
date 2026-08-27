@@ -121,12 +121,24 @@ struct SettingsView: View {
             }
 
             Section("Routing") {
-                if let input = model.inputDeviceName {
-                    LabeledContent("Capture device", value: input)
-                } else {
-                    Text("Install BlackHole (`brew install blackhole-2ch`) and set your system output to it, then this app will route the captured audio to your speakers or headphones.")
+                if model.needsDriverInstall {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("SoundEnhancer needs to install its virtual audio driver to capture system audio.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                        Button("Install Driver") {
+                            model.installDriver()
+                        }
+                    }
+                } else if let source = model.captureSourceText {
+                    LabeledContent("Virtual device", value: source)
+                    Text("System audio is routed through the SoundEnhancer virtual device and replayed to your output with the enhancer applied. Your previous output device is restored when the app quits.")
                         .font(.caption)
-                        .foregroundColor(.orange)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("Waiting for the virtual audio device…")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
         }
