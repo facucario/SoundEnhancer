@@ -17,6 +17,7 @@
 //==================================================================================================
 
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <CoreAudio/AudioHardware.h>
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -24,6 +25,8 @@
 #include <sys/syslog.h>
 #include <Accelerate/Accelerate.h>
 #include <Availability.h>
+
+#include "SoundEnhancerDSP.h"
 
 //==================================================================================================
 #pragma mark -
@@ -346,6 +349,74 @@ static const UInt32                 kDevice_SampleRatesSize             = sizeof
 #define                             kRing_Buffer_Frame_Size             ((65536 + kLatency_Frame_Size))
 static Float32*                     gRingBuffer = NULL;
 
+//==================================================================================================
+// SoundEnhancer DSP + pass-through state
+//
+// The app no longer opens a CoreAudio input stream (that is what triggered the
+// macOS "microphone in use" indicator). Instead the driver applies the DSP here,
+// in coreaudiod's process, and forwards the processed audio directly to the
+// configured physical output device. The menu-bar app only configures
+// parameters via the custom kSoundEnhancerPropertyConfig property.
+//==================================================================================================
+
+// Custom property selector. FourCC 'SEcn'. The app reads/writes this to the
+// device object to (re)configure the enhancer.
+#define kSoundEnhancerPropertyConfig        'SEcn'
+
+// All 32-bit fields: 14 words, no padding, matches the Swift SEConfig layout.
+typedef struct {
+    UInt32 enabled;          // 0/1, master enhancer bypass
+    UInt32 xtcEnabled;       // 0/1
+    Float32 width;           // 1..3
+    Float32 bassDb;          // 0..10
+    Float32 trebleDb;        // 0..10
+    Float32 spatialMix;      // 0..0.35
+    Float32 xtcIntensity;    // 0..1
+    Float32 xtcSeparation;   // meters
+    Float32 xtcDistance;     // meters
+    Float32 masterGain;      // 0..1
+    UInt32 outputDeviceID;   // target physical output device (0 = none)
+    Float32 inputLevel;      // (driver -> app) peak input
+    Float32 outputLevel;     // (driver -> app) peak output
+} SoundEnhancerConfig;
+
+static SoundEnhancerConfig          gConfig;
+static pthread_mutex_t              gConfigMutex           = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t              gDSPMutex              = PTHREAD_MUTEX_INITIALIZER;
+
+static SE_EnhancerDSP               gEnhancer;
+static SE_XTCDSP                    gXTC;
+static bool                         gDSPInitialized        = false;
+
+// pass-through FIFO (interleaved stereo Float32), single producer / consumer
+static Float32*                     gPassThruFifo          = NULL;
+static UInt32                       gPassThruCapFrames     = 1 << 12;   // 4096 frames (~43 ms at 48 kHz)
+static UInt32                       gPassThruMask          = (1 << 12) - 1;
+static UInt64                       gPassThruWriteFrames   = 0;          // atomic: frames written
+static UInt64                       gPassThruReadFP        = 0;          // atomic: read pos, 16.16 fixed point
+static double                       gPassThruRatio         = 1.0;        // consumer-only
+
+// scratch buffers for de-interleave / re-interleave
+static Float32*                     gLeftScratch           = NULL;
+static Float32*                     gRightScratch          = NULL;
+static Float32*                     gOutScratch            = NULL;
+static UInt32                       gScratchFrames         = 0;
+static Float32*                     gProcScratch           = NULL;
+static UInt32                       gProcScratchFrames     = 0;
+
+// output IO proc bound to the target physical output device
+static AudioDeviceIOProcID          gOutputIOProcID        = NULL;
+static AudioObjectID                gOutputIODeviceID      = 0;
+static pthread_mutex_t              gOutputIOMutex         = PTHREAD_MUTEX_INITIALIZER;
+static AudioStreamBasicDescription  gOutputASBD            = {0};
+static bool                         gOutputProcActive      = false;   // atomic (read by audio thread)
+static dispatch_queue_t             gOutputIOQueue         = NULL;    // serial: IO proc create/destroy
+
+// best-effort level reporting (updated on the audio thread, read by the app)
+static Float32                      gInputLevel            = 0.0f;
+static Float32                      gOutputLevel           = 0.0f;
+static Float32                      gMasterGain            = 1.0f;
+
 
 //==================================================================================================
 #pragma mark -
@@ -378,6 +449,10 @@ static OSStatus        SoundEnhancer_WillDoIOOperation(AudioServerPlugInDriverRe
 static OSStatus        SoundEnhancer_BeginIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo);
 static OSStatus        SoundEnhancer_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, AudioObjectID inStreamObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer);
 static OSStatus        SoundEnhancer_EndIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo);
+
+static OSStatus        SoundEnhancer_OutputIOProc(AudioObjectID inDevice, const AudioTimeStamp* inNow, const AudioBufferList* inInputData, const AudioTimeStamp* inInputTime, AudioBufferList* outOutputData, const AudioTimeStamp* inOutputTime, void* inClientData);
+static void            SoundEnhancer_ReconfigureOutputProc(void);
+static void            SoundEnhancer_ApplyConfig(void);
 
 //    Implementation
 static Boolean        SoundEnhancer_HasPlugInProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pid_t inClientProcessID, const AudioObjectPropertyAddress* inAddress);
@@ -790,6 +865,28 @@ static OSStatus	SoundEnhancer_Initialize(AudioServerPlugInDriverRef inDriver, Au
 		gBox_Name = CFSTR("SoundEnhancer Box");
 	}
 	
+	//	default DSP config (the app overrides this on launch)
+	gConfig.enabled = 1;
+	gConfig.xtcEnabled = 0;
+	gConfig.width = 2.0f;
+	gConfig.bassDb = 5.0f;
+	gConfig.trebleDb = 5.0f;
+	gConfig.spatialMix = 0.175f;
+	gConfig.xtcIntensity = 0.8f;
+	gConfig.xtcSeparation = 0.24f;
+	gConfig.xtcDistance = 0.50f;
+	gConfig.masterGain = 1.0f;
+	gConfig.outputDeviceID = 0;
+	gMasterGain = 1.0f;
+	
+	//	serial queue for creating/destroying the pass-through IO proc. This must
+	//	never happen synchronously from within a plug-in callback, or it deadlocks
+	//	against the HAL.
+	if (gOutputIOQueue == NULL)
+	{
+		gOutputIOQueue = dispatch_queue_create("com.fcario.soundenhancer.outputio", DISPATCH_QUEUE_SERIAL);
+	}
+	
 	//	calculate the host ticks per frame
 	struct mach_timebase_info theTimeBaseInfo;
 	mach_timebase_info(&theTimeBaseInfo);
@@ -942,6 +1039,16 @@ static OSStatus	SoundEnhancer_PerformDeviceConfigurationChange(AudioServerPlugIn
             
             //	unlock the state mutex
             pthread_mutex_unlock(&gPlugIn_StateMutex);
+            
+            //	update the DSP to the new sample rate (IO is stopped during a
+            //	config change, so this is safe from the audio thread)
+            pthread_mutex_lock(&gDSPMutex);
+            if (gDSPInitialized)
+            {
+                se_enhancer_setSampleRate(&gEnhancer, gDevice_SampleRate);
+                se_xtc_setSampleRate(&gXTC, gDevice_SampleRate);
+            }
+            pthread_mutex_unlock(&gDSPMutex);
             
             // DebugMsg("SoundEnhancer theTimeBaseInfo.numer: %u \t theTimeBaseInfo.denom: %u", theTimeBaseInfo.numer, theTimeBaseInfo.denom);
             break;
@@ -2205,6 +2312,8 @@ static Boolean	SoundEnhancer_HasDeviceProperty(AudioServerPlugInDriverRef inDriv
 		case kAudioDevicePropertyZeroTimeStampPeriod:
 		case kAudioDevicePropertyIcon:
 		case kAudioDevicePropertyStreams:
+		case kAudioObjectPropertyCustomPropertyInfoList:
+		case kSoundEnhancerPropertyConfig:
 			theAnswer = true;
 			break;
 			
@@ -2268,10 +2377,15 @@ static OSStatus	SoundEnhancer_IsDevicePropertySettable(AudioServerPlugInDriverRe
 		case kAudioDevicePropertyPreferredChannelLayout:
 		case kAudioDevicePropertyZeroTimeStampPeriod:
 		case kAudioDevicePropertyIcon:
+		case kAudioObjectPropertyCustomPropertyInfoList:
 			*outIsSettable = false;
 			break;
 		
 		case kAudioDevicePropertyNominalSampleRate:
+			*outIsSettable = true;
+			break;
+
+		case kSoundEnhancerPropertyConfig:
 			*outIsSettable = true;
 			break;
 		
@@ -2406,6 +2520,14 @@ static OSStatus	SoundEnhancer_GetDevicePropertyDataSize(AudioServerPlugInDriverR
 
 		case kAudioDevicePropertyIcon:
 			*outDataSize = sizeof(CFURLRef);
+			break;
+
+		case kAudioObjectPropertyCustomPropertyInfoList:
+			*outDataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+			break;
+
+		case kSoundEnhancerPropertyConfig:
+			*outDataSize = sizeof(CFTypeRef);
 			break;
 
 		default:
@@ -2855,6 +2977,35 @@ static OSStatus	SoundEnhancer_GetDevicePropertyData(AudioServerPlugInDriverRef i
 				*outDataSize = sizeof(CFURLRef);
 			}
 			break;
+
+		case kAudioObjectPropertyCustomPropertyInfoList:
+			{
+				FailWithAction(inDataSize < sizeof(AudioServerPlugInCustomPropertyInfo), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_GetDevicePropertyData: not enough space for the return value of kAudioObjectPropertyCustomPropertyInfoList");
+				AudioServerPlugInCustomPropertyInfo* theInfo = (AudioServerPlugInCustomPropertyInfo*)outData;
+				theInfo[0].mSelector = kSoundEnhancerPropertyConfig;
+				theInfo[0].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+				theInfo[0].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+				*outDataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+			}
+			break;
+
+		case kSoundEnhancerPropertyConfig:
+			{
+				FailWithAction(inDataSize < sizeof(CFTypeRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_GetDevicePropertyData: not enough space for the return value of kSoundEnhancerPropertyConfig");
+				SoundEnhancerConfig cfg;
+				pthread_mutex_lock(&gConfigMutex);
+				cfg = gConfig;
+				pthread_mutex_unlock(&gConfigMutex);
+				Float32 inLevel, outLevel;
+				__atomic_load(&gInputLevel, &inLevel, __ATOMIC_RELAXED);
+				__atomic_load(&gOutputLevel, &outLevel, __ATOMIC_RELAXED);
+				cfg.inputLevel = inLevel;
+				cfg.outputLevel = outLevel;
+				CFDataRef theData = CFDataCreate(NULL, (const UInt8*)&cfg, sizeof(cfg));
+				*((CFDataRef*)outData) = theData;
+				*outDataSize = sizeof(CFTypeRef);
+			}
+			break;
 			
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
@@ -2905,6 +3056,38 @@ static OSStatus	SoundEnhancer_SetDevicePropertyData(AudioServerPlugInDriverRef i
 			{
 				//	we dispatch this so that the change can happen asynchronously
 				dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{ gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, kObjectID_Device, ChangeAction_SetSampleRate, NULL); });
+			}
+			break;
+		
+		case kSoundEnhancerPropertyConfig:
+			{
+				FailWithAction(inDataSize != sizeof(CFTypeRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_SetDevicePropertyData: wrong size for the data for kSoundEnhancerPropertyConfig");
+				CFDataRef theData = *((CFDataRef*)inData);
+				FailWithAction(theData == NULL || CFGetTypeID(theData) != CFDataGetTypeID(), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_SetDevicePropertyData: expected CFData for kSoundEnhancerPropertyConfig");
+				FailWithAction(CFDataGetLength(theData) != sizeof(SoundEnhancerConfig), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_SetDevicePropertyData: wrong CFData length for kSoundEnhancerPropertyConfig");
+
+				SoundEnhancerConfig newConfig;
+				CFDataGetBytes(theData, CFRangeMake(0, sizeof(SoundEnhancerConfig)), (UInt8*)&newConfig);
+				AudioObjectID oldTarget = 0;
+
+				pthread_mutex_lock(&gConfigMutex);
+				oldTarget = gConfig.outputDeviceID;
+				gConfig = newConfig;
+				pthread_mutex_unlock(&gConfigMutex);
+
+				SoundEnhancer_ApplyConfig();
+
+				// If the target physical output changed while running, rebind the
+				// pass-through IO proc. This runs on a non-audio thread (HAL RPC),
+				// so creating/destroying IO procs here is safe.
+				bool isRunning;
+				pthread_mutex_lock(&gPlugIn_StateMutex);
+				isRunning = (gDevice_IOIsRunning > 0);
+				pthread_mutex_unlock(&gPlugIn_StateMutex);
+				if (oldTarget != newConfig.outputDeviceID && isRunning)
+				{
+					SoundEnhancer_ReconfigureOutputProc();
+				}
 			}
 			break;
 		
@@ -4313,6 +4496,287 @@ Done:
 	return theAnswer;
 }
 
+#pragma mark Pass-Through Helpers
+
+static void SoundEnhancer_EnsureScratch(UInt32 frames)
+{
+    if (frames <= gScratchFrames && gLeftScratch != NULL) return;
+
+    UInt32 newFrames = 4096;
+    while (newFrames < frames) newFrames <<= 1;
+
+    if (gLeftScratch != NULL) free(gLeftScratch);
+    if (gRightScratch != NULL) free(gRightScratch);
+    if (gOutScratch != NULL) free(gOutScratch);
+
+    gLeftScratch = (Float32*)calloc(newFrames, sizeof(Float32));
+    gRightScratch = (Float32*)calloc(newFrames, sizeof(Float32));
+    gOutScratch = (Float32*)calloc(newFrames * 2, sizeof(Float32));
+    gScratchFrames = newFrames;
+}
+
+static void SoundEnhancer_EnsureProcScratch(UInt32 frames)
+{
+    if (frames <= gProcScratchFrames && gProcScratch != NULL) return;
+
+    UInt32 newFrames = 4096;
+    while (newFrames < frames) newFrames <<= 1;
+
+    if (gProcScratch != NULL) free(gProcScratch);
+    gProcScratch = (Float32*)calloc(newFrames * 2, sizeof(Float32));
+    gProcScratchFrames = newFrames;
+}
+
+static void SoundEnhancer_PushOutput(const Float32* interleaved, UInt32 frames)
+{
+    UInt64 readFP = __atomic_load_n(&gPassThruReadFP, __ATOMIC_RELAXED);
+    UInt64 readFrames = readFP >> 16;
+
+    UInt64 used = (gPassThruWriteFrames >= readFrames) ? (gPassThruWriteFrames - readFrames) : 0;
+    if ((UInt64)frames + used > (UInt64)gPassThruCapFrames)
+    {
+        // Too full: drop this block to avoid overwriting unread data.
+        return;
+    }
+
+    UInt32 base = (UInt32)(gPassThruWriteFrames & gPassThruMask);
+    UInt32 first = gPassThruCapFrames - base;
+    if (frames <= first)
+    {
+        memcpy(gPassThruFifo + base * 2, interleaved, (size_t)frames * 2 * sizeof(Float32));
+    }
+    else
+    {
+        memcpy(gPassThruFifo + base * 2, interleaved, (size_t)first * 2 * sizeof(Float32));
+        memcpy(gPassThruFifo, interleaved + first * 2, (size_t)(frames - first) * 2 * sizeof(Float32));
+    }
+    __atomic_store_n(&gPassThruWriteFrames, gPassThruWriteFrames + frames, __ATOMIC_RELEASE);
+}
+
+static void SoundEnhancer_PullOutput(Float32* interleaved, UInt32 frames)
+{
+    UInt64 writeFrames = __atomic_load_n(&gPassThruWriteFrames, __ATOMIC_ACQUIRE);
+    double readFrames = (double)(__atomic_load_n(&gPassThruReadFP, __ATOMIC_RELAXED)) / 65536.0;
+
+    double fill = (double)writeFrames - readFrames;
+    double target = (double)(gPassThruCapFrames >> 1);
+    double correction = (fill - target) / (double)gPassThruCapFrames * 0.01;
+    gPassThruRatio = 1.0 + correction;
+    if (gPassThruRatio > 1.02) gPassThruRatio = 1.02;
+    if (gPassThruRatio < 0.98) gPassThruRatio = 0.98;
+
+    UInt32 cap = gPassThruCapFrames;
+    UInt32 mask = gPassThruMask;
+
+    for (UInt32 j = 0; j < frames; j++)
+    {
+        double pos = readFrames;
+        UInt64 ip = (UInt64)pos;
+        double frac = pos - (double)ip;
+
+        if ((ip + 1) < writeFrames)
+        {
+            UInt32 i0 = (UInt32)(ip & mask);
+            UInt32 i1 = (UInt32)((ip + 1) & mask);
+            float w0 = 1.0f - (float)frac;
+            float w1 = (float)frac;
+            interleaved[j * 2]     = gPassThruFifo[i0 * 2] * w0     + gPassThruFifo[i1 * 2] * w1;
+            interleaved[j * 2 + 1] = gPassThruFifo[i0 * 2 + 1] * w0 + gPassThruFifo[i1 * 2 + 1] * w1;
+        }
+        else
+        {
+            interleaved[j * 2] = 0.0f;
+            interleaved[j * 2 + 1] = 0.0f;
+        }
+        readFrames += gPassThruRatio;
+    }
+
+    __atomic_store_n(&gPassThruReadFP, (UInt64)(readFrames * 65536.0), __ATOMIC_RELEASE);
+}
+
+// Applies DSP to one block of interleaved stereo input. Fills gOutScratch with
+// the processed, gain-adjusted interleaved output and updates the level meters.
+static void SoundEnhancer_ProcessBlock(const Float32* interleaved, UInt32 frames)
+{
+    SoundEnhancer_EnsureScratch(frames);
+
+    UInt32 i;
+    float inPeak = 0.0f;
+    for (i = 0; i < frames; i++)
+    {
+        float l = interleaved[i * 2];
+        float r = interleaved[i * 2 + 1];
+        gLeftScratch[i] = l;
+        gRightScratch[i] = r;
+        float al = l < 0.0f ? -l : l;
+        float ar = r < 0.0f ? -r : r;
+        if (al > inPeak) inPeak = al;
+        if (ar > inPeak) inPeak = ar;
+    }
+
+    pthread_mutex_lock(&gDSPMutex);
+    se_enhancer_process(&gEnhancer, gLeftScratch, gRightScratch, (int)frames);
+    se_xtc_process(&gXTC, gLeftScratch, gRightScratch, (int)frames);
+    pthread_mutex_unlock(&gDSPMutex);
+
+    float gain;
+    __atomic_load(&gMasterGain, &gain, __ATOMIC_ACQUIRE);
+    float outPeak = 0.0f;
+    for (i = 0; i < frames; i++)
+    {
+        float l = gLeftScratch[i] * gain;
+        float r = gRightScratch[i] * gain;
+        gOutScratch[i * 2] = l;
+        gOutScratch[i * 2 + 1] = r;
+        float al = l < 0.0f ? -l : l;
+        float ar = r < 0.0f ? -r : r;
+        if (al > outPeak) outPeak = al;
+        if (ar > outPeak) outPeak = ar;
+    }
+
+    __atomic_store(&gInputLevel, &inPeak, __ATOMIC_RELEASE);
+    __atomic_store(&gOutputLevel, &outPeak, __ATOMIC_RELEASE);
+}
+
+static void SoundEnhancer_ApplyConfig(void)
+{
+    SoundEnhancerConfig cfg;
+    pthread_mutex_lock(&gConfigMutex);
+    cfg = gConfig;
+    pthread_mutex_unlock(&gConfigMutex);
+
+    pthread_mutex_lock(&gDSPMutex);
+    if (cfg.enabled)
+    {
+        se_enhancer_setParams(&gEnhancer, cfg.width, cfg.bassDb, cfg.trebleDb, cfg.spatialMix);
+    }
+    else
+    {
+        se_enhancer_setParams(&gEnhancer, 1.0f, 0.0f, 0.0f, 0.0f);
+    }
+    se_xtc_setEnabled(&gXTC, cfg.xtcEnabled != 0);
+    se_xtc_setIntensity(&gXTC, cfg.xtcIntensity);
+    se_xtc_setGeometry(&gXTC, cfg.xtcSeparation, cfg.xtcDistance);
+    pthread_mutex_unlock(&gDSPMutex);
+
+    __atomic_store(&gMasterGain, &cfg.masterGain, __ATOMIC_RELEASE);
+}
+
+static void SoundEnhancer_ReconfigureOutputProc(void)
+{
+    if (gOutputIOQueue == NULL) return;
+    dispatch_async(gOutputIOQueue, ^{
+    UInt32 target = 0;
+    pthread_mutex_lock(&gConfigMutex);
+    target = gConfig.outputDeviceID;
+    pthread_mutex_unlock(&gConfigMutex);
+
+    pthread_mutex_lock(&gOutputIOMutex);
+
+    if (target == gOutputIODeviceID)
+    {
+        pthread_mutex_unlock(&gOutputIOMutex);
+        return;
+    }
+
+    if (gOutputIOProcID != NULL)
+    {
+        AudioDeviceStop(gOutputIODeviceID, gOutputIOProcID);
+        AudioDeviceDestroyIOProcID(gOutputIODeviceID, gOutputIOProcID);
+        gOutputIOProcID = NULL;
+        gOutputIODeviceID = 0;
+        __atomic_store_n(&gOutputProcActive, false, __ATOMIC_RELEASE);
+    }
+
+    if (target != 0)
+    {
+        AudioDeviceIOProcID procID = NULL;
+        OSStatus status = AudioDeviceCreateIOProcID(target, SoundEnhancer_OutputIOProc, NULL, &procID);
+        if (status == noErr)
+        {
+            AudioStreamBasicDescription asbd = {0};
+            AudioObjectPropertyAddress addr = {
+                kAudioDevicePropertyStreamFormat,
+                kAudioObjectPropertyScopeOutput,
+                0
+            };
+            UInt32 size = sizeof(asbd);
+            AudioObjectGetPropertyData(target, &addr, 0, NULL, &size, &asbd);
+            gOutputASBD = asbd;
+
+            status = AudioDeviceStart(target, procID);
+            if (status == noErr)
+            {
+                gOutputIOProcID = procID;
+                gOutputIODeviceID = target;
+                __atomic_store_n(&gOutputProcActive, true, __ATOMIC_RELEASE);
+            }
+            else
+            {
+                AudioDeviceDestroyIOProcID(target, procID);
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&gOutputIOMutex);
+    });
+}
+
+static OSStatus SoundEnhancer_OutputIOProc(AudioObjectID inDevice, const AudioTimeStamp* inNow, const AudioBufferList* inInputData, const AudioTimeStamp* inInputTime, AudioBufferList* outOutputData, const AudioTimeStamp* inOutputTime, void* inClientData)
+{
+    #pragma unused(inDevice, inNow, inInputData, inInputTime, inOutputTime, inClientData)
+
+    if (outOutputData == NULL) return noErr;
+
+    // Determine the number of frames from the output buffer size.
+    UInt32 frames = 0;
+    if (gOutputASBD.mFormatID == kAudioFormatLinearPCM && gOutputASBD.mBitsPerChannel == 32)
+    {
+        if (gOutputASBD.mBytesPerFrame > 0 && outOutputData->mNumberBuffers > 0)
+        {
+            frames = outOutputData->mBuffers[0].mDataByteSize / gOutputASBD.mBytesPerFrame;
+        }
+    }
+    if (frames == 0)
+    {
+        // Fallback: assume non-interleaved Float32 stereo.
+        if (outOutputData->mNumberBuffers >= 2 && outOutputData->mBuffers[0].mDataByteSize > 0)
+        {
+            frames = outOutputData->mBuffers[0].mDataByteSize / sizeof(Float32);
+        }
+    }
+    if (frames == 0) return noErr;
+
+    SoundEnhancer_EnsureProcScratch(frames);
+    SoundEnhancer_PullOutput(gProcScratch, frames);
+
+    bool nonInterleaved = (gOutputASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+
+    if (nonInterleaved && outOutputData->mNumberBuffers >= 2)
+    {
+        Float32* l = (Float32*)outOutputData->mBuffers[0].mData;
+        Float32* r = (Float32*)outOutputData->mBuffers[1].mData;
+        if (l != NULL && r != NULL)
+        {
+            for (UInt32 i = 0; i < frames; i++)
+            {
+                l[i] = gProcScratch[i * 2];
+                r[i] = gProcScratch[i * 2 + 1];
+            }
+        }
+    }
+    else if (outOutputData->mNumberBuffers >= 1)
+    {
+        Float32* d = (Float32*)outOutputData->mBuffers[0].mData;
+        if (d != NULL)
+        {
+            memcpy(d, gProcScratch, (size_t)frames * 2 * sizeof(Float32));
+        }
+    }
+
+    return noErr;
+}
+
 #pragma mark IO Operations
 
 static OSStatus	SoundEnhancer_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID)
@@ -4353,9 +4817,44 @@ static OSStatus	SoundEnhancer_StartIO(AudioServerPlugInDriverRef inDriver, Audio
         gRingBuffer = calloc(kRing_Buffer_Frame_Size * kNumber_Of_Channels, sizeof(Float32));
     }
     
+    if (inDeviceObjectID == kObjectID_Device && gPassThruFifo == NULL)
+    {
+        gPassThruFifo = (Float32*)calloc((size_t)gPassThruCapFrames * 2, sizeof(Float32));
+        gPassThruWriteFrames = 0;
+        gPassThruReadFP = 0;
+        gPassThruRatio = 1.0;
+    }
+    
     
 	//	unlock the state lock
 	pthread_mutex_unlock(&gPlugIn_StateMutex);
+	
+    if (inDeviceObjectID == kObjectID_Device)
+    {
+        pthread_mutex_lock(&gDSPMutex);
+        if (!gDSPInitialized)
+        {
+            se_enhancer_init(&gEnhancer, gDevice_SampleRate);
+            se_xtc_init(&gXTC, gDevice_SampleRate);
+            gDSPInitialized = true;
+        }
+        else
+        {
+            se_enhancer_reset(&gEnhancer);
+            se_xtc_reset(&gXTC);
+        }
+        pthread_mutex_unlock(&gDSPMutex);
+
+        // Reset the pass-through FIFO. The previous output IO proc (if any) is
+        // destroyed asynchronously, so any stale read it performs for a brief
+        // moment is harmless and self-corrects.
+        gPassThruWriteFrames = 0;
+        gPassThruReadFP = 0;
+        gPassThruRatio = 1.0;
+
+        SoundEnhancer_ApplyConfig();
+        SoundEnhancer_ReconfigureOutputProc();
+    }
 	
 Done:
 	return theAnswer;
@@ -4390,9 +4889,41 @@ static OSStatus	SoundEnhancer_StopIO(AudioServerPlugInDriverRef inDriver, AudioO
         free(gRingBuffer);
         gRingBuffer = NULL;
     }
-	
+    
 	//	unlock the state lock
 	pthread_mutex_unlock(&gPlugIn_StateMutex);
+	
+    if (inDeviceObjectID == kObjectID_Device && gDevice_IOIsRunning == 0)
+    {
+        // Deinit DSP synchronously. No WriteMix runs for this device once its IO
+        // has stopped, so the DSP state is safe to release here.
+        pthread_mutex_lock(&gDSPMutex);
+        if (gDSPInitialized)
+        {
+            se_enhancer_deinit(&gEnhancer);
+            se_xtc_deinit(&gXTC);
+            gDSPInitialized = false;
+        }
+        pthread_mutex_unlock(&gDSPMutex);
+
+        // Destroy the pass-through IO proc asynchronously. Calling the HAL from
+        // within a plug-in callback synchronously would deadlock against coreaudiod.
+        if (gOutputIOQueue != NULL)
+        {
+            dispatch_async(gOutputIOQueue, ^{
+                pthread_mutex_lock(&gOutputIOMutex);
+                if (gOutputIOProcID != NULL)
+                {
+                    AudioDeviceStop(gOutputIODeviceID, gOutputIOProcID);
+                    AudioDeviceDestroyIOProcID(gOutputIODeviceID, gOutputIOProcID);
+                    gOutputIOProcID = NULL;
+                    gOutputIODeviceID = 0;
+                    __atomic_store_n(&gOutputProcActive, false, __ATOMIC_RELEASE);
+                }
+                pthread_mutex_unlock(&gOutputIOMutex);
+            });
+        }
+    }
 	
 Done:
 	return theAnswer;
@@ -4604,9 +5135,25 @@ static OSStatus	SoundEnhancer_DoIOOperation(AudioServerPlugInDriverRef inDriver,
         // TODO: Mix into the buffers but we will need to clear the buffers at some point.
         // Issue with outputting from mirrored device and main device at the same time. Not currently mixing. 
         
-        // Copy the buffers.
-        memcpy(gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, ioMainBuffer, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
-        memcpy(gRingBuffer, (Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
+        // Apply the enhancer DSP and pass the processed audio through to the
+        // configured physical output device.
+        Float32* theSource = (Float32*)ioMainBuffer;
+        bool processed = (inDeviceObjectID == kObjectID_Device && gDSPInitialized);
+        if (processed)
+        {
+            SoundEnhancer_ProcessBlock(theSource, inIOBufferFrameSize);
+            theSource = gOutScratch;
+        }
+        
+        // Copy the (possibly processed) buffers into the ring buffer.
+        memcpy(gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, theSource, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
+        memcpy(gRingBuffer, theSource + firstPartFrameSize * kNumber_Of_Channels, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
+        
+        // Forward the processed audio to the physical output device.
+        if (processed && __atomic_load_n(&gOutputProcActive, __ATOMIC_ACQUIRE))
+        {
+            SoundEnhancer_PushOutput(gOutScratch, inIOBufferFrameSize);
+        }
         
         // Save the last output host time.
         gLastOutputHostTime = mach_absolute_time();

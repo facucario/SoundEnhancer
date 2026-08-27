@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/Driver/SoundEnhancerDriver.c"
+DSP_SRC="$ROOT/Driver/SoundEnhancerDSP.c"
 PLIST="$ROOT/Driver/Info.plist"
 BUNDLE="$ROOT/SoundEnhancerDriver.driver"
 BIN="$BUNDLE/Contents/MacOS/SoundEnhancerDriver"
@@ -23,7 +24,7 @@ clang -bundle \
     -framework IOKit \
     -framework Accelerate \
     -o "$BIN" \
-    "$SRC"
+    "$SRC" "$DSP_SRC"
 
 cp "$PLIST" "$BUNDLE/Contents/Info.plist"
 

@@ -31,16 +31,13 @@ final class AppModel: ObservableObject {
     @Published var statusText: String = ""
     @Published var levelText: String = ""
 
-    let engine = AudioEngine()
-
-    private var activeInputID: AudioDeviceID?
-    private var activeOutputID: AudioDeviceID?
-    private var activeBufferSize: Int = 0
     private var currentVirtualID: AudioDeviceID?
+    private var currentTargetOutputID: AudioDeviceID?
     private var isRestoringOutput = false
     private var installInProgress = false
     private var hasAttemptedAutoInstall = false
-    private var lastAutoRestart = Date()
+    private var lastPushedMasterGain: Float = -1
+    private var lastPushedConfig: SEConfig?
     private var levelTimer: Timer?
     private let selectedOutputKey = "selectedOutputDeviceID"
     private let previousDefaultOutputKey = "previousDefaultOutputDeviceID"
@@ -58,8 +55,9 @@ final class AppModel: ObservableObject {
     }
 
     var estimatedLatencyMs: Int {
-        let sr = engine.sampleRate > 0 ? engine.sampleRate : 48000
-        return Int((Double(bufferSize) / sr * 1000.0).rounded())
+        let sr = currentVirtualID.flatMap { AudioDeviceManager.nominalSampleRate($0) } ?? 48000
+        guard sr > 0 else { return Int((Double(bufferSize) / 48000 * 1000).rounded()) }
+        return Int((Double(bufferSize) / sr * 1000).rounded())
     }
 
     init() {
@@ -78,7 +76,7 @@ final class AppModel: ObservableObject {
         ) { [weak self] _ in
             self?.restoreDefaultOutput()
         }
-        syncEngine()
+        syncDriver()
         levelTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.updateLevels()
         }
@@ -89,18 +87,15 @@ final class AppModel: ObservableObject {
     }
 
     private func updateLevels() {
-        let inDb = dbString(engine.inputLevel)
-        let outDb = dbString(engine.outputLevel)
-        levelText = "In \(inDb) · Out \(outDb)"
         applySystemVolume()
         reassertRouting()
-        if engine.isRunning, engine.inputLevel < 0.0001, Date().timeIntervalSince(lastAutoRestart) > 10 {
-            lastAutoRestart = Date()
-            restartEngine()
-        }
-        if !engine.isRunning {
-            syncEngine()
-        }
+        refreshLevels()
+    }
+
+    private func refreshLevels() {
+        guard let virtualID = currentVirtualID else { return }
+        guard let read = DriverLink.readConfig(from: virtualID) else { return }
+        levelText = "In \(dbString(read.inputLevel)) · Out \(dbString(read.outputLevel))"
     }
 
     private func applySystemVolume() {
@@ -108,20 +103,9 @@ final class AppModel: ObservableObject {
         let db = AudioDeviceManager.volumeDecibels(virtualID)
         let muted = AudioDeviceManager.isMuted(virtualID)
         let gain: Float = muted ? 0.0 : powf(10.0, db / 20.0)
-        engine.setMasterGain(gain)
-    }
-
-    private func restartEngine() {
-        guard let inID = activeInputID, let outID = activeOutputID else { return }
-        do {
-            try engine.start(inputDeviceID: inID, outputDeviceID: outID, bufferSize: UInt32(bufferSize))
-            applyDSP()
-            applyXTC()
-            updateStatus()
-            AudioLog.write("auto-restart: engine restarted (input silent)")
-        } catch {
-            statusText = "Audio engine error: \(error.localizedDescription)"
-        }
+        guard abs(gain - lastPushedMasterGain) > 0.0001 else { return }
+        lastPushedMasterGain = gain
+        pushConfig()
     }
 
     private func dbString(_ level: Float) -> String {
@@ -130,40 +114,24 @@ final class AppModel: ObservableObject {
     }
 
     func applyDSP() {
-        guard isEnabled else {
-            engine.setParameters(width: 1.0, bassDb: 0, trebleDb: 0, spatialMix: 0)
-            return
-        }
-        if useAdvanced {
-            engine.setParameters(
-                width: Float(width),
-                bassDb: Float(bassDb),
-                trebleDb: Float(trebleDb),
-                spatialMix: Float(spatial / 100.0))
-        } else {
-            let a = intensity
-            engine.setParameters(
-                width: Float(1.0 + 2.0 * a),
-                bassDb: Float(10.0 * a),
-                trebleDb: Float(10.0 * a),
-                spatialMix: Float(0.35 * a))
-        }
+        pushConfig()
     }
 
     func applyOutputSelection() {
         UserDefaults.standard.set(Int(selectedOutputDeviceID), forKey: selectedOutputKey)
-        syncEngine()
+        currentTargetOutputID = 0
+        syncDriver()
     }
 
     func applyXTC() {
-        engine.setXTCEnabled(xtcEnabled)
-        let (s, d) = xtcGeometryValues()
-        engine.setXTCGeometry(separation: s, distance: d)
-        engine.setXTCIntensity(Float(xtcIntensity))
+        pushConfig()
     }
 
     func applyBufferSize() {
-        syncEngine()
+        if let virtualID = currentVirtualID {
+            AudioDeviceManager.setBufferFrameSize(virtualID, frames: UInt32(bufferSize))
+        }
+        pushConfig()
     }
 
     func installDriver() {
@@ -174,7 +142,7 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.installInProgress = false
-                self.syncEngine()
+                self.syncDriver()
             }
         }
     }
@@ -208,12 +176,12 @@ final class AppModel: ObservableObject {
 
     private func devicesChanged() {
         refreshDevices()
-        syncEngine()
+        syncDriver()
     }
 
     private func defaultOutputChanged() {
         if selectedOutputDeviceID == 0 {
-            syncEngine()
+            syncDriver()
         }
         reassertRouting()
     }
@@ -248,15 +216,15 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func syncEngine() {
+    private func syncDriver() {
         refreshDevices()
 
         if !DriverInstaller.isUpToDate() {
             needsDriverInstall = true
             captureSourceText = nil
+            currentVirtualID = nil
             statusText = "SoundEnhancer audio driver needs to be installed or updated."
             AudioLog.write("sync: driver not installed or outdated")
-            stopEngine()
             if !hasAttemptedAutoInstall {
                 hasAttemptedAutoInstall = true
                 installDriver()
@@ -270,7 +238,6 @@ final class AppModel: ObservableObject {
             currentVirtualID = nil
             statusText = "Waiting for the SoundEnhancer virtual device…"
             AudioLog.write("sync: virtual device not found")
-            stopEngine()
             return
         }
 
@@ -287,39 +254,63 @@ final class AppModel: ObservableObject {
 
         captureSourceText = virtual.displayName
 
-        let needRestart = !engine.isRunning
-            || activeInputID != virtual.id
-            || activeOutputID != outputID
-            || activeBufferSize != bufferSize
-
-        guard needRestart else { return }
-
-        do {
-            try engine.start(inputDeviceID: virtual.id, outputDeviceID: outputID, bufferSize: UInt32(bufferSize))
-            activeInputID = virtual.id
-            activeOutputID = outputID
-            activeBufferSize = bufferSize
-            applyDSP()
-            applyXTC()
-            updateStatus()
-            AudioLog.write("sync: engine started in=\(virtual.id) out=\(outputID)")
-        } catch {
-            statusText = "Audio engine error: \(error.localizedDescription)"
-            AudioLog.write("sync: engine error \(error)")
+        if let target = AudioDeviceManager.device(id: outputID), target.nominalSampleRate > 0 {
+            let currentRate = AudioDeviceManager.nominalSampleRate(virtual.id)
+            if abs(currentRate - target.nominalSampleRate) > 0.5 {
+                AudioDeviceManager.setNominalSampleRate(virtual.id, rate: target.nominalSampleRate)
+            }
         }
+
+        if currentTargetOutputID != outputID {
+            currentTargetOutputID = outputID
+            AudioDeviceManager.setBufferFrameSize(virtual.id, frames: UInt32(bufferSize))
+        }
+
+        pushConfig()
     }
 
-    private func stopEngine() {
-        if engine.isRunning {
-            engine.stop()
-            activeInputID = nil
-            activeOutputID = nil
-            activeBufferSize = 0
+    private func pushConfig() {
+        guard let virtualID = currentVirtualID, let outputID = currentTargetOutputID else { return }
+
+        var cfg = SEConfig()
+        cfg.enabled = isEnabled ? 1 : 0
+        cfg.outputDeviceID = outputID
+        cfg.masterGain = lastPushedMasterGain < 0 ? 1.0 : lastPushedMasterGain
+
+        if useAdvanced {
+            cfg.width = Float(width)
+            cfg.bassDb = Float(bassDb)
+            cfg.trebleDb = Float(trebleDb)
+            cfg.spatialMix = Float(spatial / 100.0)
+        } else {
+            let a = intensity
+            cfg.width = Float(1.0 + 2.0 * a)
+            cfg.bassDb = Float(10.0 * a)
+            cfg.trebleDb = Float(10.0 * a)
+            cfg.spatialMix = Float(0.35 * a)
+        }
+
+        cfg.xtcEnabled = xtcEnabled ? 1 : 0
+        let (s, d) = xtcGeometryValues()
+        cfg.xtcIntensity = Float(xtcIntensity)
+        cfg.xtcSeparation = Float(s)
+        cfg.xtcDistance = Float(d)
+
+        if cfg == lastPushedConfig {
+            return
+        }
+
+        lastPushedConfig = cfg
+        if DriverLink.writeConfig(cfg, to: virtualID) {
+            updateStatus()
+        } else {
+            statusText = "Could not configure the audio driver."
+            AudioLog.write("push: failed to write config to \(virtualID)")
         }
     }
 
     private func updateStatus() {
-        let sr = engine.sampleRate
+        let sr = currentVirtualID.flatMap { AudioDeviceManager.nominalSampleRate($0) } ?? 48000
         statusText = "\(Int(sr)) Hz · \(bufferSize) frames · ~\(estimatedLatencyMs) ms"
     }
 }

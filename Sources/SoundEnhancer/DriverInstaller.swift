@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import os
 
@@ -29,11 +30,20 @@ enum DriverInstaller {
         return plist["CFBundleVersion"] as? String
     }
 
+    private static func binaryHash(at path: String) -> String? {
+        let binPath = (path as NSString).appendingPathComponent("Contents/MacOS/SoundEnhancerDriver")
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: binPath)) else { return nil }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     static func isUpToDate() -> Bool {
         guard let bundled = bundledURL(), isInstalled() else { return false }
         let bundledVersion = version(at: bundled.path)
         let installedVersion = version(at: installedPath)
-        return bundledVersion != nil && installedVersion == bundledVersion
+        guard bundledVersion != nil, installedVersion == bundledVersion else { return false }
+        guard let bundledHash = binaryHash(at: bundled.path),
+              let installedHash = binaryHash(at: installedPath) else { return false }
+        return bundledHash == installedHash
     }
 
     /// Installs the driver to /Library/Audio/Plug-Ins/HAL and reloads coreaudiod.
