@@ -139,6 +139,7 @@ void se_enhancer_init(SE_EnhancerDSP* d, double sampleRate)
 {
     memset(d, 0, sizeof(*d));
     d->sampleRate = sampleRate;
+    d->enabled = true;
     enhancer_allocate_delay(d);
     se_enhancer_setParams(d, 1.0f, 0.0f, 0.0f, 0.0f);
 }
@@ -156,6 +157,13 @@ void se_enhancer_setSampleRate(SE_EnhancerDSP* d, double sampleRate)
     d->sampleRate = sampleRate;
     enhancer_allocate_delay(d);
     enhancer_recompute_filters(d);
+}
+
+void se_enhancer_setEnabled(SE_EnhancerDSP* d, bool enabled)
+{
+    if (d->enabled == enabled) return;
+    d->enabled = enabled;
+    se_enhancer_reset(d);
 }
 
 void se_enhancer_setParams(SE_EnhancerDSP* d, float width, float bassDb, float trebleDb, float spatialMix)
@@ -185,6 +193,10 @@ void se_enhancer_reset(SE_EnhancerDSP* d)
 void se_enhancer_process(SE_EnhancerDSP* d, float* left, float* right, int frameCount)
 {
     if (frameCount <= 0) return;
+
+    // Bit-transparent bypass when the enhancer is disabled. This also skips the
+    // soft-clip limiter, so a bypassed enhancer cannot saturate or reduce peaks.
+    if (!d->enabled) return;
 
     for (int i = 0; i < frameCount; i++)
     {

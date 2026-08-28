@@ -84,6 +84,15 @@ enum AudioDeviceManager {
         return value
     }
 
+    static func setVolumeDecibels(_ id: AudioDeviceID, _ db: Float32) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeDecibels,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        var value = db
+        _ = AudioObjectSetPropertyData(id, &address, 0, nil, UInt32(MemoryLayout<Float32>.size), &value)
+    }
+
     static func isMuted(_ id: AudioDeviceID) -> Bool {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyMute,

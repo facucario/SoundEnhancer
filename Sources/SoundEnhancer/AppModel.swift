@@ -41,6 +41,8 @@ final class AppModel: ObservableObject {
     private var levelTimer: Timer?
     private let selectedOutputKey = "selectedOutputDeviceID"
     private let previousDefaultOutputKey = "previousDefaultOutputDeviceID"
+    private var previousVolumeDb: Float = 0
+    private var previousMute: Bool = false
 
     private var previousDefaultOutputID: AudioDeviceID {
         get {
@@ -155,6 +157,8 @@ final class AppModel: ObservableObject {
         guard saved != 0 else { return }
         let current = AudioDeviceManager.defaultOutputDeviceID()
         if current != saved {
+            AudioDeviceManager.setVolumeDecibels(saved, previousVolumeDb)
+            AudioDeviceManager.setMuted(saved, previousMute)
             AudioDeviceManager.setDefaultOutputDevice(saved)
             modelLog.info("restored default output to \(saved)")
         }
@@ -221,7 +225,23 @@ final class AppModel: ObservableObject {
             let current = AudioDeviceManager.defaultOutputDeviceID()
             if current != virtual.id, current != 0 {
                 previousDefaultOutputID = current
+                previousVolumeDb = AudioDeviceManager.volumeDecibels(current)
+                previousMute = AudioDeviceManager.isMuted(current)
+
                 AudioDeviceManager.setDefaultOutputDevice(virtual.id)
+
+                // Carry the user's volume over to the virtual device and make the
+                // physical device a transparent (full-volume) render target so the
+                // virtual device owns the user-facing volume and has full headroom.
+                AudioDeviceManager.setVolumeDecibels(virtual.id, previousVolumeDb)
+                AudioDeviceManager.setMuted(virtual.id, previousMute)
+                AudioDeviceManager.setVolume(current, scalar: 1.0)
+                AudioDeviceManager.setMuted(current, false)
+
+                // Sync masterGain now so the carried-over volume takes effect
+                // immediately instead of waiting for the next level poll.
+                applySystemVolume()
+
                 AudioLog.write("auto-select: default \(current) -> \(virtual.id)")
             }
         }

@@ -4646,13 +4646,10 @@ static void SoundEnhancer_ApplyConfig(void)
     pthread_mutex_unlock(&gConfigMutex);
 
     pthread_mutex_lock(&gDSPMutex);
+    se_enhancer_setEnabled(&gEnhancer, cfg.enabled != 0);
     if (cfg.enabled)
     {
         se_enhancer_setParams(&gEnhancer, cfg.width, cfg.bassDb, cfg.trebleDb, cfg.spatialMix);
-    }
-    else
-    {
-        se_enhancer_setParams(&gEnhancer, 1.0f, 0.0f, 0.0f, 0.0f);
     }
     se_xtc_setEnabled(&gXTC, cfg.xtcEnabled != 0);
     se_xtc_setIntensity(&gXTC, cfg.xtcIntensity);

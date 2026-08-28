@@ -64,6 +64,8 @@ static inline float se_soft_clip(float x)
 typedef struct {
     double sampleRate;
 
+    bool   enabled;
+
     SE_Biquad lowShelfL, lowShelfR;
     SE_Biquad highShelfL, highShelfR;
     SE_Biquad midDipL, midDipR;
@@ -83,6 +85,7 @@ typedef struct {
 void se_enhancer_init(SE_EnhancerDSP* d, double sampleRate);
 void se_enhancer_deinit(SE_EnhancerDSP* d);
 void se_enhancer_setSampleRate(SE_EnhancerDSP* d, double sampleRate);
+void se_enhancer_setEnabled(SE_EnhancerDSP* d, bool enabled);
 void se_enhancer_setParams(SE_EnhancerDSP* d, float width, float bassDb, float trebleDb, float spatialMix);
 void se_enhancer_reset(SE_EnhancerDSP* d);
 void se_enhancer_process(SE_EnhancerDSP* d, float* left, float* right, int frameCount);
