@@ -132,7 +132,7 @@ struct SettingsView: View {
                     }
                 } else if let source = model.captureSourceText {
                     LabeledContent("Virtual device", value: source)
-                    Text("System audio is routed through the SoundEnhancer virtual device and replayed to your output with the enhancer applied. Your previous output device is restored when the app quits.")
+                    Text("Select the SoundEnhancer device as your output in macOS sound settings. Audio is then processed and replayed to the output chosen above. Switch back to your regular output any time to bypass.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 } else {

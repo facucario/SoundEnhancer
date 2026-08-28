@@ -26,7 +26,7 @@ struct MenuView: View {
                     .font(.caption)
                     .foregroundColor(.orange)
             } else if let source = model.captureSourceText {
-                Label("Capture: \(source)", systemImage: "arrow.down.circle")
+                Label("Virtual device: \(source)", systemImage: "waveform")
                     .font(.caption)
             } else {
                 Label("Starting…", systemImage: "pause.circle")

@@ -33,9 +33,9 @@ final class AppModel: ObservableObject {
 
     private var currentVirtualID: AudioDeviceID?
     private var currentTargetOutputID: AudioDeviceID?
-    private var isRestoringOutput = false
     private var installInProgress = false
     private var hasAttemptedAutoInstall = false
+    private var hasAutoSelectedOutput = false
     private var lastPushedMasterGain: Float = -1
     private var lastPushedConfig: SEConfig?
     private var levelTimer: Timer?
@@ -68,9 +68,6 @@ final class AppModel: ObservableObject {
         AudioDeviceManager.addDeviceChangeListener { [weak self] in
             self?.devicesChanged()
         }
-        AudioDeviceManager.addDefaultOutputChangeListener { [weak self] in
-            self?.defaultOutputChanged()
-        }
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -88,7 +85,6 @@ final class AppModel: ObservableObject {
 
     private func updateLevels() {
         applySystemVolume()
-        reassertRouting()
         refreshLevels()
     }
 
@@ -147,22 +143,21 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func restoreDefaultOutput() {
-        isRestoringOutput = true
-        defer { isRestoringOutput = false }
-        let saved = previousDefaultOutputID
-        guard saved != 0 else { return }
-        if AudioDeviceManager.defaultOutputDeviceID() != saved {
-            AudioDeviceManager.setDefaultOutputDevice(saved)
-            modelLog.info("restored default output to \(saved)")
-        }
-    }
-
     private func xtcGeometryValues() -> (separation: Double, distance: Double) {
         if xtcGeometry == .custom {
             return (customSeparation, customDistance)
         }
         return (xtcGeometry.separation, xtcGeometry.distance)
+    }
+
+    func restoreDefaultOutput() {
+        let saved = previousDefaultOutputID
+        guard saved != 0 else { return }
+        let current = AudioDeviceManager.defaultOutputDeviceID()
+        if current != saved {
+            AudioDeviceManager.setDefaultOutputDevice(saved)
+            modelLog.info("restored default output to \(saved)")
+        }
     }
 
     // MARK: - Internals
@@ -179,21 +174,10 @@ final class AppModel: ObservableObject {
         syncDriver()
     }
 
-    private func defaultOutputChanged() {
-        if selectedOutputDeviceID == 0 {
-            syncDriver()
-        }
-        reassertRouting()
-    }
-
     private func resolveOutputID(avoiding excluded: AudioDeviceID) -> AudioDeviceID {
         if selectedOutputDeviceID != 0, selectedOutputDeviceID != excluded,
            outputDevices.contains(where: { $0.id == selectedOutputDeviceID }) {
             return selectedOutputDeviceID
-        }
-        if previousDefaultOutputID != 0, previousDefaultOutputID != excluded,
-           outputDevices.contains(where: { $0.id == previousDefaultOutputID }) {
-            return previousDefaultOutputID
         }
         return physicalOutputID(avoiding: excluded) ?? 0
     }
@@ -202,18 +186,6 @@ final class AppModel: ObservableObject {
         let candidates = outputDevices.filter { $0.id != excluded }
         return candidates.first(where: { $0.uid.hasPrefix("BuiltIn") })?.id
             ?? candidates.first?.id
-    }
-
-    private func reassertRouting() {
-        guard !isRestoringOutput, let virtualID = currentVirtualID else { return }
-        let current = AudioDeviceManager.defaultOutputDeviceID()
-        if current != virtualID, current != 0 {
-            if previousDefaultOutputID == 0 {
-                previousDefaultOutputID = current
-            }
-            AudioDeviceManager.setDefaultOutputDevice(virtualID)
-            AudioLog.write("re-route: default \(current) -> \(virtualID)")
-        }
     }
 
     private func syncDriver() {
@@ -243,7 +215,16 @@ final class AppModel: ObservableObject {
 
         needsDriverInstall = false
         currentVirtualID = virtual.id
-        reassertRouting()
+
+        if !hasAutoSelectedOutput {
+            hasAutoSelectedOutput = true
+            let current = AudioDeviceManager.defaultOutputDeviceID()
+            if current != virtual.id, current != 0 {
+                previousDefaultOutputID = current
+                AudioDeviceManager.setDefaultOutputDevice(virtual.id)
+                AudioLog.write("auto-select: default \(current) -> \(virtual.id)")
+            }
+        }
 
         let outputID = resolveOutputID(avoiding: virtual.id)
         guard outputID != 0 else {
