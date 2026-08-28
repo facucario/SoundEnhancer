@@ -8,26 +8,78 @@ private let modelLog = Logger(subsystem: "com.fcario.soundenhancer", category: "
 
 final class AppModel: ObservableObject {
 
-    @Published var isEnabled: Bool = true
-    @Published var intensity: Double = 0.5
+    private enum SettingKey: String {
+        case isEnabled
+        case intensity
+        case useAdvanced
+        case width
+        case bassDb
+        case trebleDb
+        case spatial
+        case xtcEnabled
+        case xtcGeometry
+        case xtcIntensity
+        case customSeparation
+        case customDistance
+        case bufferSize
+    }
 
-    @Published var useAdvanced: Bool = false
-    @Published var width: Double = 1.6
-    @Published var bassDb: Double = 3.0
-    @Published var trebleDb: Double = 3.5
-    @Published var spatial: Double = 12.5
+    private static let defaults = UserDefaults.standard
 
-    @Published var xtcEnabled: Bool = false
-    @Published var xtcGeometry: XTCGeometry = .macBook
-    @Published var xtcIntensity: Double = 0.8
-    @Published var customSeparation: Double = 0.60
-    @Published var customDistance: Double = 0.80
+    private static func load<T>(_ key: SettingKey, _ fallback: T) -> T {
+        defaults.object(forKey: key.rawValue) as? T ?? fallback
+    }
+
+    private static func save(_ value: Any, _ key: SettingKey) {
+        defaults.set(value, forKey: key.rawValue)
+    }
+
+    @Published var isEnabled: Bool = true {
+        didSet { Self.save(isEnabled, .isEnabled) }
+    }
+    @Published var intensity: Double = 0.5 {
+        didSet { Self.save(intensity, .intensity) }
+    }
+
+    @Published var useAdvanced: Bool = false {
+        didSet { Self.save(useAdvanced, .useAdvanced) }
+    }
+    @Published var width: Double = 1.6 {
+        didSet { Self.save(width, .width) }
+    }
+    @Published var bassDb: Double = 3.0 {
+        didSet { Self.save(bassDb, .bassDb) }
+    }
+    @Published var trebleDb: Double = 3.5 {
+        didSet { Self.save(trebleDb, .trebleDb) }
+    }
+    @Published var spatial: Double = 12.5 {
+        didSet { Self.save(spatial, .spatial) }
+    }
+
+    @Published var xtcEnabled: Bool = false {
+        didSet { Self.save(xtcEnabled, .xtcEnabled) }
+    }
+    @Published var xtcGeometry: XTCGeometry = .macBook {
+        didSet { Self.save(xtcGeometry.rawValue, .xtcGeometry) }
+    }
+    @Published var xtcIntensity: Double = 0.8 {
+        didSet { Self.save(xtcIntensity, .xtcIntensity) }
+    }
+    @Published var customSeparation: Double = 0.60 {
+        didSet { Self.save(customSeparation, .customSeparation) }
+    }
+    @Published var customDistance: Double = 0.80 {
+        didSet { Self.save(customDistance, .customDistance) }
+    }
 
     @Published var outputDevices: [AudioDevice] = []
     @Published var selectedOutputDeviceID: AudioDeviceID = 0
     @Published var captureSourceText: String?
     @Published var needsDriverInstall: Bool = false
-    @Published var bufferSize: Int = 256
+    @Published var bufferSize: Int = 256 {
+        didSet { Self.save(bufferSize, .bufferSize) }
+    }
     @Published var statusText: String = ""
     @Published var levelText: String = ""
 
@@ -63,6 +115,20 @@ final class AppModel: ObservableObject {
     }
 
     init() {
+        isEnabled = Self.load(.isEnabled, true)
+        intensity = Self.load(.intensity, 0.5)
+        useAdvanced = Self.load(.useAdvanced, false)
+        width = Self.load(.width, 1.6)
+        bassDb = Self.load(.bassDb, 3.0)
+        trebleDb = Self.load(.trebleDb, 3.5)
+        spatial = Self.load(.spatial, 12.5)
+        xtcEnabled = Self.load(.xtcEnabled, false)
+        xtcGeometry = XTCGeometry(rawValue: Self.load(.xtcGeometry, XTCGeometry.macBook.rawValue)) ?? .macBook
+        xtcIntensity = Self.load(.xtcIntensity, 0.8)
+        customSeparation = Self.load(.customSeparation, 0.60)
+        customDistance = Self.load(.customDistance, 0.80)
+        bufferSize = Self.load(.bufferSize, 256)
+
         if let saved = UserDefaults.standard.object(forKey: selectedOutputKey) as? Int {
             selectedOutputDeviceID = AudioDeviceID(saved)
         }
