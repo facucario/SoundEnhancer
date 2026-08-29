@@ -19,7 +19,15 @@ cp "$BIN" "$APP/Contents/MacOS/SoundEnhancer"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 cp -R "$ROOT/SoundEnhancerDriver.driver" "$APP/Contents/Resources/SoundEnhancerDriver.driver"
 
-echo "Codesigning (ad-hoc)..."
-codesign --force --sign - "$APP"
+IDENTITY="${CODE_SIGN_IDENTITY:--}"
+ENTITLEMENTS="$ROOT/Scripts/SoundEnhancer.entitlements"
+if [ "$IDENTITY" = "-" ]; then
+    echo "Codesigning app (ad-hoc)..."
+    codesign --force --sign - "$APP"
+else
+    echo "Codesigning app ($IDENTITY) with hardened runtime..."
+    codesign --force --sign "$IDENTITY" --timestamp --options runtime \
+        --entitlements "$ENTITLEMENTS" "$APP"
+fi
 
 echo "Done: $APP"

@@ -1,3 +1,5 @@
+.DS_Store
 /.build
-SoundEnhancer.app
-SoundEnhancerDriver.driver
+/SoundEnhancer.app
+/SoundEnhancerDriver.driver
+/dist

@@ -28,7 +28,13 @@ clang -bundle \
 
 cp "$PLIST" "$BUNDLE/Contents/Info.plist"
 
-echo "Codesigning driver (ad-hoc)..."
-codesign --force --sign - "$BUNDLE"
+IDENTITY="${CODE_SIGN_IDENTITY:--}"
+if [ "$IDENTITY" = "-" ]; then
+    echo "Codesigning driver (ad-hoc)..."
+    codesign --force --sign - "$BUNDLE"
+else
+    echo "Codesigning driver ($IDENTITY)..."
+    codesign --force --sign "$IDENTITY" --timestamp "$BUNDLE"
+fi
 
 echo "Done: $BUNDLE"
