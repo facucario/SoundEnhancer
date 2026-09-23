@@ -4624,13 +4624,17 @@ static void SoundEnhancer_PullOutput(Float32* interleaved, UInt32 frames)
             float w1 = (float)frac;
             interleaved[j * 2]     = gPassThruFifo[i0 * 2] * w0     + gPassThruFifo[i1 * 2] * w1;
             interleaved[j * 2 + 1] = gPassThruFifo[i0 * 2 + 1] * w0 + gPassThruFifo[i1 * 2 + 1] * w1;
+            readFrames += gPassThruRatio;
         }
         else
         {
+            // No data available (underrun). Output silence but do NOT advance
+            // the read pointer. Advancing here would let the read position race
+            // ahead of the write position during silence, which then takes a
+            // long time to recover from once audio starts playing again.
             interleaved[j * 2] = 0.0f;
             interleaved[j * 2 + 1] = 0.0f;
         }
-        readFrames += gPassThruRatio;
     }
 
     __atomic_store_n(&gPassThruReadFP, (UInt64)(readFrames * 65536.0), __ATOMIC_RELEASE);
