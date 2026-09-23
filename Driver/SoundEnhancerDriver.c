@@ -23,6 +23,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/syslog.h>
+#include <unistd.h>
 #include <Accelerate/Accelerate.h>
 #include <Availability.h>
 
@@ -363,6 +364,13 @@ static Float32*                     gRingBuffer = NULL;
 // device object to (re)configure the enhancer.
 #define kSoundEnhancerPropertyConfig        'SEcn'
 
+// Custom property selector. FourCC 'SErc'. The app writes this after the
+// system wakes from sleep to force the pass-through output IO proc to be torn
+// down and re-bound to the physical output device. On wake, coreaudiod stops
+// the physical device's IO and the existing IO proc is not automatically
+// restarted, which leaves the enhancer receiving audio but producing nothing.
+#define kSoundEnhancerPropertyReconnect     'SErc'
+
 // All 32-bit fields: 14 words, no padding, matches the Swift SEConfig layout.
 typedef struct {
     UInt32 enabled;          // 0/1, master enhancer bypass
@@ -451,7 +459,7 @@ static OSStatus        SoundEnhancer_DoIOOperation(AudioServerPlugInDriverRef in
 static OSStatus        SoundEnhancer_EndIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo);
 
 static OSStatus        SoundEnhancer_OutputIOProc(AudioObjectID inDevice, const AudioTimeStamp* inNow, const AudioBufferList* inInputData, const AudioTimeStamp* inInputTime, AudioBufferList* outOutputData, const AudioTimeStamp* inOutputTime, void* inClientData);
-static void            SoundEnhancer_ReconfigureOutputProc(void);
+static void            SoundEnhancer_ReconfigureOutputProc(bool inForce);
 static void            SoundEnhancer_ApplyConfig(void);
 
 //    Implementation
@@ -2314,6 +2322,7 @@ static Boolean	SoundEnhancer_HasDeviceProperty(AudioServerPlugInDriverRef inDriv
 		case kAudioDevicePropertyStreams:
 		case kAudioObjectPropertyCustomPropertyInfoList:
 		case kSoundEnhancerPropertyConfig:
+		case kSoundEnhancerPropertyReconnect:
 			theAnswer = true;
 			break;
 			
@@ -2386,6 +2395,10 @@ static OSStatus	SoundEnhancer_IsDevicePropertySettable(AudioServerPlugInDriverRe
 			break;
 
 		case kSoundEnhancerPropertyConfig:
+			*outIsSettable = true;
+			break;
+
+		case kSoundEnhancerPropertyReconnect:
 			*outIsSettable = true;
 			break;
 		
@@ -2523,10 +2536,14 @@ static OSStatus	SoundEnhancer_GetDevicePropertyDataSize(AudioServerPlugInDriverR
 			break;
 
 		case kAudioObjectPropertyCustomPropertyInfoList:
-			*outDataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+			*outDataSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			break;
 
 		case kSoundEnhancerPropertyConfig:
+			*outDataSize = sizeof(CFTypeRef);
+			break;
+
+		case kSoundEnhancerPropertyReconnect:
 			*outDataSize = sizeof(CFTypeRef);
 			break;
 
@@ -2980,12 +2997,25 @@ static OSStatus	SoundEnhancer_GetDevicePropertyData(AudioServerPlugInDriverRef i
 
 		case kAudioObjectPropertyCustomPropertyInfoList:
 			{
-				FailWithAction(inDataSize < sizeof(AudioServerPlugInCustomPropertyInfo), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_GetDevicePropertyData: not enough space for the return value of kAudioObjectPropertyCustomPropertyInfoList");
+				FailWithAction(inDataSize < (2 * sizeof(AudioServerPlugInCustomPropertyInfo)), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_GetDevicePropertyData: not enough space for the return value of kAudioObjectPropertyCustomPropertyInfoList");
 				AudioServerPlugInCustomPropertyInfo* theInfo = (AudioServerPlugInCustomPropertyInfo*)outData;
 				theInfo[0].mSelector = kSoundEnhancerPropertyConfig;
 				theInfo[0].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
 				theInfo[0].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
-				*outDataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+				theInfo[1].mSelector = kSoundEnhancerPropertyReconnect;
+				theInfo[1].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+				theInfo[1].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+				*outDataSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
+			}
+			break;
+
+		case kSoundEnhancerPropertyReconnect:
+			{
+				FailWithAction(inDataSize < sizeof(CFTypeRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_GetDevicePropertyData: not enough space for the return value of kSoundEnhancerPropertyReconnect");
+				UInt32 value = 0;
+				CFDataRef theData = CFDataCreate(NULL, (const UInt8*)&value, sizeof(value));
+				*((CFDataRef*)outData) = theData;
+				*outDataSize = sizeof(CFTypeRef);
 			}
 			break;
 
@@ -3086,8 +3116,20 @@ static OSStatus	SoundEnhancer_SetDevicePropertyData(AudioServerPlugInDriverRef i
 				pthread_mutex_unlock(&gPlugIn_StateMutex);
 				if (oldTarget != newConfig.outputDeviceID && isRunning)
 				{
-					SoundEnhancer_ReconfigureOutputProc();
+					SoundEnhancer_ReconfigureOutputProc(false);
 				}
+			}
+			break;
+
+		case kSoundEnhancerPropertyReconnect:
+			{
+				FailWithAction(inDataSize != sizeof(CFTypeRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_SetDevicePropertyData: wrong size for the data for kSoundEnhancerPropertyReconnect");
+
+				// The system has woken from sleep. coreaudiod stopped the physical
+				// output device's IO, and the pass-through IO proc we bound to it is
+				// no longer being called even though its device ID is unchanged. Force
+				// a tear-down and re-bind so audio starts flowing again.
+				SoundEnhancer_ReconfigureOutputProc(true);
 			}
 			break;
 		
@@ -4582,13 +4624,17 @@ static void SoundEnhancer_PullOutput(Float32* interleaved, UInt32 frames)
             float w1 = (float)frac;
             interleaved[j * 2]     = gPassThruFifo[i0 * 2] * w0     + gPassThruFifo[i1 * 2] * w1;
             interleaved[j * 2 + 1] = gPassThruFifo[i0 * 2 + 1] * w0 + gPassThruFifo[i1 * 2 + 1] * w1;
+            readFrames += gPassThruRatio;
         }
         else
         {
+            // No data available (underrun). Output silence but do NOT advance
+            // the read pointer. Advancing here would let the read position race
+            // ahead of the write position during silence, which then takes a
+            // long time to recover from once audio starts playing again.
             interleaved[j * 2] = 0.0f;
             interleaved[j * 2 + 1] = 0.0f;
         }
-        readFrames += gPassThruRatio;
     }
 
     __atomic_store_n(&gPassThruReadFP, (UInt64)(readFrames * 65536.0), __ATOMIC_RELEASE);
@@ -4659,7 +4705,29 @@ static void SoundEnhancer_ApplyConfig(void)
     __atomic_store(&gMasterGain, &cfg.masterGain, __ATOMIC_RELEASE);
 }
 
-static void SoundEnhancer_ReconfigureOutputProc(void)
+static void SoundEnhancer_KickTargetSampleRate(AudioObjectID inDevice)
+{
+    if (inDevice == 0) return;
+
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    Float64 rate = 0.0;
+    UInt32 size = sizeof(rate);
+    if (AudioObjectGetPropertyData(inDevice, &addr, 0, NULL, &size, &rate) != noErr || rate <= 0.0 || rate > 768000.0)
+    {
+        rate = 48000.0;
+    }
+
+    // Re-writing the nominal sample rate wakes a DisplayPort/HDMI output whose
+    // audio clock stopped when the display went to sleep. Writing the same
+    // value is a no-op for a device that is already running normally.
+    AudioObjectSetPropertyData(inDevice, &addr, 0, NULL, sizeof(rate), &rate);
+}
+
+static void SoundEnhancer_ReconfigureOutputProc(bool inForce)
 {
     if (gOutputIOQueue == NULL) return;
     dispatch_async(gOutputIOQueue, ^{
@@ -4670,7 +4738,7 @@ static void SoundEnhancer_ReconfigureOutputProc(void)
 
     pthread_mutex_lock(&gOutputIOMutex);
 
-    if (target == gOutputIODeviceID)
+    if (!inForce && target == gOutputIODeviceID)
     {
         pthread_mutex_unlock(&gOutputIOMutex);
         return;
@@ -4687,10 +4755,25 @@ static void SoundEnhancer_ReconfigureOutputProc(void)
 
     if (target != 0)
     {
-        AudioDeviceIOProcID procID = NULL;
-        OSStatus status = AudioDeviceCreateIOProcID(target, SoundEnhancer_OutputIOProc, NULL, &procID);
-        if (status == noErr)
+        // After the system wakes, a DisplayPort/HDMI output may not be ready to
+        // accept an IO proc immediately. Retry the bind a few times so the
+        // device's audio clock has a chance to come back online.
+        for (int attempt = 0; attempt < 5; attempt++)
         {
+            if (attempt > 0)
+            {
+                usleep(200000);
+            }
+
+            SoundEnhancer_KickTargetSampleRate(target);
+
+            AudioDeviceIOProcID procID = NULL;
+            OSStatus status = AudioDeviceCreateIOProcID(target, SoundEnhancer_OutputIOProc, NULL, &procID);
+            if (status != noErr)
+            {
+                continue;
+            }
+
             AudioStreamBasicDescription asbd = {0};
             AudioObjectPropertyAddress addr = {
                 kAudioDevicePropertyStreamFormat,
@@ -4698,20 +4781,48 @@ static void SoundEnhancer_ReconfigureOutputProc(void)
                 0
             };
             UInt32 size = sizeof(asbd);
-            AudioObjectGetPropertyData(target, &addr, 0, NULL, &size, &asbd);
+            if (AudioObjectGetPropertyData(target, &addr, 0, NULL, &size, &asbd) != noErr)
+            {
+                AudioDeviceDestroyIOProcID(target, procID);
+                continue;
+            }
             gOutputASBD = asbd;
 
             status = AudioDeviceStart(target, procID);
-            if (status == noErr)
-            {
-                gOutputIOProcID = procID;
-                gOutputIODeviceID = target;
-                __atomic_store_n(&gOutputProcActive, true, __ATOMIC_RELEASE);
-            }
-            else
+            if (status != noErr)
             {
                 AudioDeviceDestroyIOProcID(target, procID);
+                continue;
             }
+
+            // A DisplayPort/HDMI device can return noErr from AudioDeviceStart
+            // even though its audio transport has not come back up yet (e.g.
+            // right after the display wakes). Verify the device actually reports
+            // running before considering the bind successful, otherwise the IO
+            // proc is never called and no audio flows.
+            bool deviceRunning = true;
+            UInt32 running = 0;
+            UInt32 runningSize = sizeof(running);
+            AudioObjectPropertyAddress runningAddr = {
+                kAudioDevicePropertyDeviceIsRunning,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            if (AudioObjectGetPropertyData(target, &runningAddr, 0, NULL, &runningSize, &running) == noErr)
+            {
+                deviceRunning = (running != 0);
+            }
+            if (!deviceRunning)
+            {
+                AudioDeviceStop(target, procID);
+                AudioDeviceDestroyIOProcID(target, procID);
+                continue;
+            }
+
+            gOutputIOProcID = procID;
+            gOutputIODeviceID = target;
+            __atomic_store_n(&gOutputProcActive, true, __ATOMIC_RELEASE);
+            break;
         }
     }
 
@@ -4850,7 +4961,7 @@ static OSStatus	SoundEnhancer_StartIO(AudioServerPlugInDriverRef inDriver, Audio
         gPassThruRatio = 1.0;
 
         SoundEnhancer_ApplyConfig();
-        SoundEnhancer_ReconfigureOutputProc();
+        SoundEnhancer_ReconfigureOutputProc(false);
     }
 	
 Done:

@@ -91,7 +91,12 @@ final class AppModel: ObservableObject {
     private var lastPushedMasterGain: Float = -1
     private var lastPushedConfig: SEConfig?
     private var levelTimer: Timer?
+    private var wakeRetryCount = 0
+    private var hasForcedInitialReconnect = false
+    private var wakeObserver: NSObjectProtocol?
+    private var willTerminateObserver: NSObjectProtocol?
     private let selectedOutputKey = "selectedOutputDeviceID"
+    private let selectedOutputUIDKey = "selectedOutputDeviceUID"
     private let previousDefaultOutputKey = "previousDefaultOutputDeviceID"
     private var previousVolumeDb: Float = 0
     private var previousMute: Bool = false
@@ -106,6 +111,14 @@ final class AppModel: ObservableObject {
         set {
             UserDefaults.standard.set(Int(newValue), forKey: previousDefaultOutputKey)
         }
+    }
+
+    // The selected output is remembered by UID so it survives the device being
+    // re-enumerated with a new AudioDeviceID (e.g. a DisplayPort/USB monitor
+    // after the system wakes from sleep).
+    private var selectedOutputDeviceUID: String {
+        get { UserDefaults.standard.string(forKey: selectedOutputUIDKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: selectedOutputUIDKey) }
     }
 
     var estimatedLatencyMs: Int {
@@ -136,10 +149,17 @@ final class AppModel: ObservableObject {
         AudioDeviceManager.addDeviceChangeListener { [weak self] in
             self?.devicesChanged()
         }
-        NotificationCenter.default.addObserver(
+        // The block-based observers must be retained, otherwise the notification
+        // center deallocates them and the wake handler never fires.
+        willTerminateObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.restoreDefaultOutput()
+        }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleWake()
         }
         syncDriver()
         levelTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -183,8 +203,19 @@ final class AppModel: ObservableObject {
 
     func applyOutputSelection() {
         UserDefaults.standard.set(Int(selectedOutputDeviceID), forKey: selectedOutputKey)
+        if selectedOutputDeviceID == 0 {
+            selectedOutputDeviceUID = ""
+        } else if let device = outputDevices.first(where: { $0.id == selectedOutputDeviceID }) {
+            selectedOutputDeviceUID = device.uid
+        }
         currentTargetOutputID = 0
         syncDriver()
+        // Force the driver to tear down and re-bind its pass-through output IO
+        // proc. This recovers from a DisplayPort/HDMI output that was already
+        // bound to the driver but stopped producing audio after sleep.
+        if let virtualID = currentVirtualID {
+            DriverLink.reconnectOutput(to: virtualID)
+        }
     }
 
     func applyXTC() {
@@ -230,11 +261,56 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // The system woke from sleep. coreaudiod stops the physical output device's
+    // IO during sleep, and the driver's pass-through IO proc is not automatically
+    // restarted, so the enhancer keeps receiving audio but nothing comes out.
+    // Re-resolve the target device and force the driver to re-bind its output.
+    private func handleWake() {
+        AudioLog.write("wake: reconnecting output")
+        wakeRetryCount = 0
+        reconnectOutput()
+    }
+
+    private func reconnectOutput() {
+        syncDriver()
+        // Force a full tear-down and re-bind of the driver's output IO proc for
+        // the first few attempts. After that just keep re-syncing so a device
+        // that re-appears (with a new ID) gets re-selected and re-bound.
+        if wakeRetryCount < 6, let virtualID = currentVirtualID {
+            if DriverLink.reconnectOutput(to: virtualID) {
+                AudioLog.write("wake: output reconnected to \(currentTargetOutputID ?? 0)")
+            } else {
+                AudioLog.write("wake: failed to reconnect output")
+            }
+        }
+        wakeRetryCount += 1
+        if wakeRetryCount < 30 {
+            let delay = wakeRetryCount < 6 ? 1.0 : 2.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.reconnectOutput()
+            }
+        }
+    }
+
     // MARK: - Internals
 
     private func refreshDevices() {
         outputDevices = AudioDeviceManager.outputDevices()
-        if selectedOutputDeviceID != 0, !outputDevices.contains(where: { $0.id == selectedOutputDeviceID }) {
+
+        if selectedOutputDeviceID != 0,
+           let current = outputDevices.first(where: { $0.id == selectedOutputDeviceID }) {
+            selectedOutputDeviceUID = current.uid
+            return
+        }
+
+        // The selected device is gone (it may have been re-enumerated with a new
+        // AudioDeviceID after sleep, or briefly removed while the display's link
+        // was down). Re-resolve it by UID if we remember one; otherwise fall back
+        // to no selection so syncDriver picks a physical device.
+        if !selectedOutputDeviceUID.isEmpty,
+           let reenumerated = outputDevices.first(where: { $0.uid == selectedOutputDeviceUID }) {
+            selectedOutputDeviceID = reenumerated.id
+        } else if selectedOutputDeviceID != 0 {
             selectedOutputDeviceID = 0
         }
     }
@@ -334,6 +410,16 @@ final class AppModel: ObservableObject {
         }
 
         pushConfig()
+
+        // On launch the virtual device's IO may already be running with a
+        // pass-through output proc that coreaudiod stopped while the system was
+        // asleep. Force a single re-bind so a monitor that went silent after
+        // sleep recovers even when there is no fresh wake event (e.g. quitting
+        // and relaunching the app).
+        if !hasForcedInitialReconnect {
+            hasForcedInitialReconnect = true
+            DriverLink.reconnectOutput(to: virtual.id)
+        }
     }
 
     private func pushConfig() {

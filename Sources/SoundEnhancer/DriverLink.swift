@@ -7,6 +7,11 @@ import Foundation
 // what previously triggered the macOS "microphone in use" indicator.
 let kSoundEnhancerPropertyConfig: AudioObjectPropertySelector = 0x5345636E // 'SEcn'
 
+// FourCC 'SErc'. Writing this to the virtual device forces the driver to tear
+// down and re-bind its pass-through output IO proc. The app writes it after the
+// system wakes from sleep, when coreaudiod has stopped the physical device's IO.
+let kSoundEnhancerPropertyReconnect: AudioObjectPropertySelector = 0x53457263 // 'SErc'
+
 // Must match the C struct `SoundEnhancerConfig` in SoundEnhancerDriver.c:
 // all 32-bit fields, no padding.
 struct SEConfig: Equatable {
@@ -74,5 +79,21 @@ enum DriverLink {
         var cfg = SEConfig()
         CFDataGetBytes(data, CFRange(location: 0, length: CFDataGetLength(data)), &cfg)
         return cfg
+    }
+
+    @discardableResult
+    static func reconnectOutput(to deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kSoundEnhancerPropertyReconnect,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var value: UInt32 = 1
+        let data: CFData = withUnsafeBytes(of: &value) { raw in
+            CFDataCreate(nil, raw.baseAddress?.assumingMemoryBound(to: UInt8.self), raw.count)
+        }
+        var cfValue = Unmanaged.passUnretained(data)
+        let status = AudioObjectSetPropertyData(
+            deviceID, &address, 0, nil, UInt32(MemoryLayout<Unmanaged<CFData>>.size), &cfValue)
+        return status == noErr
     }
 }

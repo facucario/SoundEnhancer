@@ -17,6 +17,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/SoundEnhancer"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp -R "$ROOT/SoundEnhancerDriver.driver" "$APP/Contents/Resources/SoundEnhancerDriver.driver"
 
 IDENTITY="${CODE_SIGN_IDENTITY:--}"
