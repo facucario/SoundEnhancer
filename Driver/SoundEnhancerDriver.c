@@ -4882,9 +4882,9 @@ static void SoundEnhancer_StartWatchdog(void)
         pthread_mutex_unlock(&gPlugIn_StateMutex);
         if (!running) return;
 
-        AudioObjectID target = SoundEnhancer_ResolveOutputDeviceID();
-        if (target == 0) return;
-
+        // Check the cheap signals first so a healthy pass-through proc costs
+        // nothing but a couple of atomics. Only re-enumerate the device list
+        // (via ResolveOutputDeviceID) when we actually need to re-bind.
         bool active;
         __atomic_load(&gOutputProcActive, &active, __ATOMIC_ACQUIRE);
 
@@ -4900,12 +4900,14 @@ static void SoundEnhancer_StartWatchdog(void)
             stalled = (elapsed >= 3.0);
         }
 
-        if (!active || stalled)
-        {
-            SE_LOG("SE watchdog: output proc inactive/stalled (active=%d), re-binding", active ? 1 : 0);
-            __atomic_store_n(&gWatchdogBusy, true, __ATOMIC_RELEASE);
-            SoundEnhancer_ReconfigureOutputProc(true);
-        }
+        if (active && !stalled) return;
+
+        AudioObjectID target = SoundEnhancer_ResolveOutputDeviceID();
+        if (target == 0) return;
+
+        SE_LOG("SE watchdog: output proc inactive/stalled (active=%d), re-binding", active ? 1 : 0);
+        __atomic_store_n(&gWatchdogBusy, true, __ATOMIC_RELEASE);
+        SoundEnhancer_ReconfigureOutputProc(true);
     });
     dispatch_resume(gOutputWatchdog);
 }

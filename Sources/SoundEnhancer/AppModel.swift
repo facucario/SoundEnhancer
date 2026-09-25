@@ -188,8 +188,10 @@ final class AppModel: ObservableObject {
         // exists (AudioDeviceCreateIOProcID then fails with
         // kAudioHardwareBadDeviceError). Re-sync on a slow cadence so a dead
         // target is re-resolved and a re-appeared monitor is re-selected.
+        // (Every 5s; the wake retry loop drives a faster cadence right after
+        // sleep, so this only needs to be a background safety net.)
         devicePollTick += 1
-        if devicePollTick % 4 == 0 {
+        if devicePollTick % 10 == 0 {
             syncDriver()
         }
     }
