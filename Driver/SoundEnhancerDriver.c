@@ -22,6 +22,8 @@
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/syslog.h>
 #include <unistd.h>
 #include <Accelerate/Accelerate.h>
@@ -81,6 +83,10 @@
     }
 
 #endif
+
+// Always-on diagnostic log (writes to the unified log under coreaudiod).
+// Used sparingly for low-frequency state changes only, not per audio buffer.
+#define SE_LOG(...) syslog(LOG_NOTICE, __VA_ARGS__)
 
 
 //==================================================================================================
@@ -371,6 +377,14 @@ static Float32*                     gRingBuffer = NULL;
 // restarted, which leaves the enhancer receiving audio but producing nothing.
 #define kSoundEnhancerPropertyReconnect     'SErc'
 
+// Custom property selector. FourCC 'SEud'. The app writes the target physical
+// output device's UID (a CFString) here. AudioObjectIDs are assigned per HAL
+// connection, so the numeric outputDeviceID the app sends is not meaningful
+// inside this plug-in's process (the IDs drift apart after a monitor is
+// re-enumerated). The UID is stable, so the driver re-resolves it against its
+// own device list before binding the pass-through IO proc.
+#define kSoundEnhancerPropertyOutputUID     'SEud'
+
 // All 32-bit fields: 14 words, no padding, matches the Swift SEConfig layout.
 typedef struct {
     UInt32 enabled;          // 0/1, master enhancer bypass
@@ -391,6 +405,7 @@ typedef struct {
 static SoundEnhancerConfig          gConfig;
 static pthread_mutex_t              gConfigMutex           = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t              gDSPMutex              = PTHREAD_MUTEX_INITIALIZER;
+static char                         gOutputDeviceUID[256]  = {0};  // guarded by gConfigMutex
 
 static SE_EnhancerDSP               gEnhancer;
 static SE_XTCDSP                    gXTC;
@@ -419,6 +434,9 @@ static pthread_mutex_t              gOutputIOMutex         = PTHREAD_MUTEX_INITI
 static AudioStreamBasicDescription  gOutputASBD            = {0};
 static bool                         gOutputProcActive      = false;   // atomic (read by audio thread)
 static dispatch_queue_t             gOutputIOQueue         = NULL;    // serial: IO proc create/destroy
+static UInt64                       gLastOutputCallbackHostTime = 0;  // atomic: last IO proc invocation
+static dispatch_source_t            gOutputWatchdog        = NULL;
+static bool                         gWatchdogBusy          = false;   // atomic
 
 // best-effort level reporting (updated on the audio thread, read by the app)
 static Float32                      gInputLevel            = 0.0f;
@@ -461,6 +479,8 @@ static OSStatus        SoundEnhancer_EndIOOperation(AudioServerPlugInDriverRef i
 static OSStatus        SoundEnhancer_OutputIOProc(AudioObjectID inDevice, const AudioTimeStamp* inNow, const AudioBufferList* inInputData, const AudioTimeStamp* inInputTime, AudioBufferList* outOutputData, const AudioTimeStamp* inOutputTime, void* inClientData);
 static void            SoundEnhancer_ReconfigureOutputProc(bool inForce);
 static void            SoundEnhancer_ApplyConfig(void);
+static void            SoundEnhancer_StartWatchdog(void);
+static AudioObjectID   SoundEnhancer_ResolveOutputDeviceID(void);
 
 //    Implementation
 static Boolean        SoundEnhancer_HasPlugInProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pid_t inClientProcessID, const AudioObjectPropertyAddress* inAddress);
@@ -894,6 +914,7 @@ static OSStatus	SoundEnhancer_Initialize(AudioServerPlugInDriverRef inDriver, Au
 	{
 		gOutputIOQueue = dispatch_queue_create("com.fcario.soundenhancer.outputio", DISPATCH_QUEUE_SERIAL);
 	}
+	SoundEnhancer_StartWatchdog();
 	
 	//	calculate the host ticks per frame
 	struct mach_timebase_info theTimeBaseInfo;
@@ -2323,6 +2344,7 @@ static Boolean	SoundEnhancer_HasDeviceProperty(AudioServerPlugInDriverRef inDriv
 		case kAudioObjectPropertyCustomPropertyInfoList:
 		case kSoundEnhancerPropertyConfig:
 		case kSoundEnhancerPropertyReconnect:
+		case kSoundEnhancerPropertyOutputUID:
 			theAnswer = true;
 			break;
 			
@@ -2399,6 +2421,10 @@ static OSStatus	SoundEnhancer_IsDevicePropertySettable(AudioServerPlugInDriverRe
 			break;
 
 		case kSoundEnhancerPropertyReconnect:
+			*outIsSettable = true;
+			break;
+
+		case kSoundEnhancerPropertyOutputUID:
 			*outIsSettable = true;
 			break;
 		
@@ -2536,7 +2562,7 @@ static OSStatus	SoundEnhancer_GetDevicePropertyDataSize(AudioServerPlugInDriverR
 			break;
 
 		case kAudioObjectPropertyCustomPropertyInfoList:
-			*outDataSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
+			*outDataSize = 3 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			break;
 
 		case kSoundEnhancerPropertyConfig:
@@ -2544,6 +2570,10 @@ static OSStatus	SoundEnhancer_GetDevicePropertyDataSize(AudioServerPlugInDriverR
 			break;
 
 		case kSoundEnhancerPropertyReconnect:
+			*outDataSize = sizeof(CFTypeRef);
+			break;
+
+		case kSoundEnhancerPropertyOutputUID:
 			*outDataSize = sizeof(CFTypeRef);
 			break;
 
@@ -2997,7 +3027,7 @@ static OSStatus	SoundEnhancer_GetDevicePropertyData(AudioServerPlugInDriverRef i
 
 		case kAudioObjectPropertyCustomPropertyInfoList:
 			{
-				FailWithAction(inDataSize < (2 * sizeof(AudioServerPlugInCustomPropertyInfo)), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_GetDevicePropertyData: not enough space for the return value of kAudioObjectPropertyCustomPropertyInfoList");
+				FailWithAction(inDataSize < (3 * sizeof(AudioServerPlugInCustomPropertyInfo)), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_GetDevicePropertyData: not enough space for the return value of kAudioObjectPropertyCustomPropertyInfoList");
 				AudioServerPlugInCustomPropertyInfo* theInfo = (AudioServerPlugInCustomPropertyInfo*)outData;
 				theInfo[0].mSelector = kSoundEnhancerPropertyConfig;
 				theInfo[0].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
@@ -3005,7 +3035,10 @@ static OSStatus	SoundEnhancer_GetDevicePropertyData(AudioServerPlugInDriverRef i
 				theInfo[1].mSelector = kSoundEnhancerPropertyReconnect;
 				theInfo[1].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
 				theInfo[1].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
-				*outDataSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
+				theInfo[2].mSelector = kSoundEnhancerPropertyOutputUID;
+				theInfo[2].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+				theInfo[2].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+				*outDataSize = 3 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			}
 			break;
 
@@ -3015,6 +3048,18 @@ static OSStatus	SoundEnhancer_GetDevicePropertyData(AudioServerPlugInDriverRef i
 				UInt32 value = 0;
 				CFDataRef theData = CFDataCreate(NULL, (const UInt8*)&value, sizeof(value));
 				*((CFDataRef*)outData) = theData;
+				*outDataSize = sizeof(CFTypeRef);
+			}
+			break;
+
+		case kSoundEnhancerPropertyOutputUID:
+			{
+				FailWithAction(inDataSize < sizeof(CFTypeRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_GetDevicePropertyData: not enough space for the return value of kSoundEnhancerPropertyOutputUID");
+				pthread_mutex_lock(&gConfigMutex);
+				CFStringRef theString = CFStringCreateWithCString(NULL, gOutputDeviceUID, kCFStringEncodingUTF8);
+				pthread_mutex_unlock(&gConfigMutex);
+				if (theString == NULL) theString = CFSTR("");
+				*((CFStringRef*)outData) = theString;
 				*outDataSize = sizeof(CFTypeRef);
 			}
 			break;
@@ -3105,6 +3150,8 @@ static OSStatus	SoundEnhancer_SetDevicePropertyData(AudioServerPlugInDriverRef i
 				gConfig = newConfig;
 				pthread_mutex_unlock(&gConfigMutex);
 
+				SE_LOG("SE config: outputDeviceID %u -> %u (enabled=%u)", oldTarget, newConfig.outputDeviceID, newConfig.enabled);
+
 				SoundEnhancer_ApplyConfig();
 
 				// If the target physical output changed while running, rebind the
@@ -3129,6 +3176,30 @@ static OSStatus	SoundEnhancer_SetDevicePropertyData(AudioServerPlugInDriverRef i
 				// output device's IO, and the pass-through IO proc we bound to it is
 				// no longer being called even though its device ID is unchanged. Force
 				// a tear-down and re-bind so audio starts flowing again.
+				SE_LOG("SE reconnect property written (app forced reconnect)");
+				SoundEnhancer_ReconfigureOutputProc(true);
+			}
+			break;
+
+		case kSoundEnhancerPropertyOutputUID:
+			{
+				FailWithAction(inDataSize != sizeof(CFTypeRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_SetDevicePropertyData: wrong size for the data for kSoundEnhancerPropertyOutputUID");
+				CFStringRef theString = *((CFStringRef*)inData);
+				FailWithAction(theString == NULL || CFGetTypeID(theString) != CFStringGetTypeID(), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_SetDevicePropertyData: expected CFString for kSoundEnhancerPropertyOutputUID");
+
+				char buf[256];
+				bool ok = CFStringGetCString(theString, buf, sizeof(buf), kCFStringEncodingUTF8);
+				FailWithAction(!ok, theAnswer = kAudioHardwareBadPropertySizeError, Done, "SoundEnhancer_SetDevicePropertyData: failed to decode kSoundEnhancerPropertyOutputUID");
+
+				pthread_mutex_lock(&gConfigMutex);
+				strncpy(gOutputDeviceUID, buf, sizeof(gOutputDeviceUID) - 1);
+				gOutputDeviceUID[sizeof(gOutputDeviceUID) - 1] = '\0';
+				pthread_mutex_unlock(&gConfigMutex);
+
+				SE_LOG("SE output UID set: '%s'", gOutputDeviceUID);
+
+				// The target may now resolve to a different ID in this process's
+				// namespace; re-bind.
 				SoundEnhancer_ReconfigureOutputProc(true);
 			}
 			break;
@@ -4705,6 +4776,63 @@ static void SoundEnhancer_ApplyConfig(void)
     __atomic_store(&gMasterGain, &cfg.masterGain, __ATOMIC_RELEASE);
 }
 
+// Diagnostic: dump the device list as seen from the plugin host's own HAL
+// context. This reveals whether the host still maps the target AudioDeviceID
+// the same way the app does after a sleep/wake re-enumeration.
+static void SoundEnhancer_LogDeviceList(const char* inReason)
+{
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size) != noErr || size == 0)
+    {
+        SE_LOG("SE devicelist (%s): query failed size=%u", inReason, size);
+        return;
+    }
+    UInt32 count = size / sizeof(AudioObjectID);
+    AudioObjectID* ids = (AudioObjectID*)malloc(size);
+    if (ids == NULL) return;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, ids) != noErr)
+    {
+        free(ids);
+        return;
+    }
+
+    for (UInt32 i = 0; i < count; i++)
+    {
+        char name[128] = "?";
+        char uid[256] = "?";
+
+        AudioObjectPropertyAddress naddr = {
+            kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+        };
+        CFStringRef nameRef = NULL;
+        UInt32 nsize = sizeof(nameRef);
+        if (AudioObjectGetPropertyData(ids[i], &naddr, 0, NULL, &nsize, &nameRef) == noErr && nameRef != NULL)
+        {
+            CFStringGetCString(nameRef, name, sizeof(name), kCFStringEncodingUTF8);
+            CFRelease(nameRef);
+        }
+
+        AudioObjectPropertyAddress uaddr = {
+            kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+        };
+        CFStringRef uidRef = NULL;
+        UInt32 usize = sizeof(uidRef);
+        if (AudioObjectGetPropertyData(ids[i], &uaddr, 0, NULL, &usize, &uidRef) == noErr && uidRef != NULL)
+        {
+            CFStringGetCString(uidRef, uid, sizeof(uid), kCFStringEncodingUTF8);
+            CFRelease(uidRef);
+        }
+
+        SE_LOG("SE devicelist: id=%u name='%s' uid='%s'", ids[i], name, uid);
+    }
+    free(ids);
+}
+
 static void SoundEnhancer_KickTargetSampleRate(AudioObjectID inDevice)
 {
     if (inDevice == 0) return;
@@ -4727,27 +4855,148 @@ static void SoundEnhancer_KickTargetSampleRate(AudioObjectID inDevice)
     AudioObjectSetPropertyData(inDevice, &addr, 0, NULL, sizeof(rate), &rate);
 }
 
+// Periodically verify the pass-through output IO proc is still being called.
+// When a DisplayPort/USB-C monitor goes into (deep) sleep, coreaudiod stops the
+// physical device's IO and never calls the IO proc again even though the driver
+// still thinks it is bound. Detecting the stall here and re-binding means audio
+// recovers without any action from the menu-bar app, regardless of whether the
+// app received a wake notification.
+static void SoundEnhancer_StartWatchdog(void)
+{
+    if (gOutputWatchdog != NULL) return;
+
+    gOutputWatchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0));
+    dispatch_source_set_timer(gOutputWatchdog,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+        (uint64_t)(3 * NSEC_PER_SEC),
+        (uint64_t)(500 * NSEC_PER_MSEC));
+    dispatch_source_set_event_handler(gOutputWatchdog, ^{
+        bool busy;
+        __atomic_load(&gWatchdogBusy, &busy, __ATOMIC_ACQUIRE);
+        if (busy) return;
+
+        bool running;
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        running = (gDevice_IOIsRunning > 0);
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        if (!running) return;
+
+        AudioObjectID target = SoundEnhancer_ResolveOutputDeviceID();
+        if (target == 0) return;
+
+        bool active;
+        __atomic_load(&gOutputProcActive, &active, __ATOMIC_ACQUIRE);
+
+        bool stalled = false;
+        if (active)
+        {
+            UInt64 last;
+            __atomic_load(&gLastOutputCallbackHostTime, &last, __ATOMIC_ACQUIRE);
+            if (last == 0) return;
+            double elapsed = (gHostClockFrequency > 0.0)
+                ? (double)(mach_absolute_time() - last) / gHostClockFrequency
+                : 0.0;
+            stalled = (elapsed >= 3.0);
+        }
+
+        if (!active || stalled)
+        {
+            SE_LOG("SE watchdog: output proc inactive/stalled (active=%d), re-binding", active ? 1 : 0);
+            __atomic_store_n(&gWatchdogBusy, true, __ATOMIC_RELEASE);
+            SoundEnhancer_ReconfigureOutputProc(true);
+        }
+    });
+    dispatch_resume(gOutputWatchdog);
+}
+
+// Resolve the target physical output device in THIS process's HAL namespace.
+// AudioObjectIDs are per-connection, so the numeric ID the app sends cannot be
+// trusted here; instead re-map the app-provided UID to the local device ID.
+static AudioObjectID SoundEnhancer_ResolveOutputDeviceID(void)
+{
+    char uid[256];
+    AudioObjectID fallback = 0;
+    pthread_mutex_lock(&gConfigMutex);
+    strncpy(uid, gOutputDeviceUID, sizeof(uid) - 1);
+    uid[sizeof(uid) - 1] = '\0';
+    fallback = gConfig.outputDeviceID;
+    pthread_mutex_unlock(&gConfigMutex);
+
+    if (uid[0] == '\0') return fallback;
+
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size) != noErr || size == 0)
+    {
+        return 0;
+    }
+    UInt32 count = size / sizeof(AudioObjectID);
+    AudioObjectID* ids = (AudioObjectID*)malloc(size);
+    if (ids == NULL) return 0;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, ids) != noErr)
+    {
+        free(ids);
+        return 0;
+    }
+
+    AudioObjectID found = 0;
+    for (UInt32 i = 0; i < count && found == 0; i++)
+    {
+        AudioObjectPropertyAddress uaddr = {
+            kAudioDevicePropertyDeviceUID,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        CFStringRef uidRef = NULL;
+        UInt32 usize = sizeof(uidRef);
+        if (AudioObjectGetPropertyData(ids[i], &uaddr, 0, NULL, &usize, &uidRef) == noErr && uidRef != NULL)
+        {
+            char buf[256];
+            if (CFStringGetCString(uidRef, buf, sizeof(buf), kCFStringEncodingUTF8) && strcmp(buf, uid) == 0)
+            {
+                found = ids[i];
+            }
+            CFRelease(uidRef);
+        }
+    }
+    free(ids);
+
+    if (found == 0)
+    {
+        SE_LOG("SE resolve: UID '%s' not found in local device list", uid);
+    }
+    return found;
+}
+
 static void SoundEnhancer_ReconfigureOutputProc(bool inForce)
 {
     if (gOutputIOQueue == NULL) return;
     dispatch_async(gOutputIOQueue, ^{
-    UInt32 target = 0;
-    pthread_mutex_lock(&gConfigMutex);
-    target = gConfig.outputDeviceID;
-    pthread_mutex_unlock(&gConfigMutex);
+    UInt32 target = SoundEnhancer_ResolveOutputDeviceID();
 
     pthread_mutex_lock(&gOutputIOMutex);
 
+    SE_LOG("SE reconfigure: target=%u force=%d current=%u procID=%p",
+           target, inForce ? 1 : 0, gOutputIODeviceID, (void*)gOutputIOProcID);
+
     if (!inForce && target == gOutputIODeviceID)
     {
+        SE_LOG("SE reconfigure: no-op (same target)");
         pthread_mutex_unlock(&gOutputIOMutex);
         return;
     }
 
     if (gOutputIOProcID != NULL)
     {
+        SE_LOG("SE reconfigure: stopping old proc on device %u", gOutputIODeviceID);
         AudioDeviceStop(gOutputIODeviceID, gOutputIOProcID);
         AudioDeviceDestroyIOProcID(gOutputIODeviceID, gOutputIOProcID);
+        SE_LOG("SE reconfigure: old proc destroyed");
         gOutputIOProcID = NULL;
         gOutputIODeviceID = 0;
         __atomic_store_n(&gOutputProcActive, false, __ATOMIC_RELEASE);
@@ -4771,6 +5020,11 @@ static void SoundEnhancer_ReconfigureOutputProc(bool inForce)
             OSStatus status = AudioDeviceCreateIOProcID(target, SoundEnhancer_OutputIOProc, NULL, &procID);
             if (status != noErr)
             {
+                SE_LOG("SE reconfigure: attempt %d CreateIOProcID failed (%d)", attempt, status);
+                if (status == kAudioHardwareBadDeviceError && attempt == 0)
+                {
+                    SoundEnhancer_LogDeviceList("CreateIOProcID bad device");
+                }
                 continue;
             }
 
@@ -4783,6 +5037,7 @@ static void SoundEnhancer_ReconfigureOutputProc(bool inForce)
             UInt32 size = sizeof(asbd);
             if (AudioObjectGetPropertyData(target, &addr, 0, NULL, &size, &asbd) != noErr)
             {
+                SE_LOG("SE reconfigure: attempt %d GetStreamFormat failed", attempt);
                 AudioDeviceDestroyIOProcID(target, procID);
                 continue;
             }
@@ -4791,6 +5046,7 @@ static void SoundEnhancer_ReconfigureOutputProc(bool inForce)
             status = AudioDeviceStart(target, procID);
             if (status != noErr)
             {
+                SE_LOG("SE reconfigure: attempt %d AudioDeviceStart failed (%d)", attempt, status);
                 AudioDeviceDestroyIOProcID(target, procID);
                 continue;
             }
@@ -4814,6 +5070,7 @@ static void SoundEnhancer_ReconfigureOutputProc(bool inForce)
             }
             if (!deviceRunning)
             {
+                SE_LOG("SE reconfigure: attempt %d device not running, retrying", attempt);
                 AudioDeviceStop(target, procID);
                 AudioDeviceDestroyIOProcID(target, procID);
                 continue;
@@ -4822,17 +5079,31 @@ static void SoundEnhancer_ReconfigureOutputProc(bool inForce)
             gOutputIOProcID = procID;
             gOutputIODeviceID = target;
             __atomic_store_n(&gOutputProcActive, true, __ATOMIC_RELEASE);
+            __atomic_store_n(&gLastOutputCallbackHostTime, mach_absolute_time(), __ATOMIC_RELEASE);
+            SE_LOG("SE reconfigure: bound output proc to device %u (attempt %d)", target, attempt);
             break;
         }
     }
 
+    SE_LOG("SE reconfigure: done, active=%d procID=%p",
+           gOutputProcActive ? 1 : 0, (void*)gOutputIOProcID);
+
     pthread_mutex_unlock(&gOutputIOMutex);
+    __atomic_store_n(&gWatchdogBusy, false, __ATOMIC_RELEASE);
     });
 }
 
 static OSStatus SoundEnhancer_OutputIOProc(AudioObjectID inDevice, const AudioTimeStamp* inNow, const AudioBufferList* inInputData, const AudioTimeStamp* inInputTime, AudioBufferList* outOutputData, const AudioTimeStamp* inOutputTime, void* inClientData)
 {
     #pragma unused(inDevice, inNow, inInputData, inInputTime, inOutputTime, inClientData)
+
+    __atomic_store_n(&gLastOutputCallbackHostTime, mach_absolute_time(), __ATOMIC_RELEASE);
+
+    static UInt64 sCallbackCount = 0;
+    if (__atomic_add_fetch(&sCallbackCount, 1, __ATOMIC_RELAXED) <= 3)
+    {
+        SE_LOG("SE output proc: callback on device %u", inDevice);
+    }
 
     if (outOutputData == NULL) return noErr;
 
@@ -4895,7 +5166,7 @@ static OSStatus	SoundEnhancer_StartIO(AudioServerPlugInDriverRef inDriver, Audio
 	//	So, work only needs to be done when the first client starts. All subsequent starts simply
 	//	increment the counter.
     
-    DebugMsg("SoundEnhancer_StartIO");
+    SE_LOG("SE StartIO: device=%u", inDeviceObjectID);
 	
 	#pragma unused(inClientID, inDeviceObjectID)
 	
@@ -4974,6 +5245,8 @@ static OSStatus	SoundEnhancer_StopIO(AudioServerPlugInDriverRef inDriver, AudioO
 	//	once all clients have stopped.
 	
 	#pragma unused(inClientID, inDeviceObjectID)
+
+    SE_LOG("SE StopIO: device=%u", inDeviceObjectID);
 	
 	//	declare the local variables
 	OSStatus theAnswer = 0;

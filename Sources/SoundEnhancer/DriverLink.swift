@@ -12,6 +12,11 @@ let kSoundEnhancerPropertyConfig: AudioObjectPropertySelector = 0x5345636E // 'S
 // system wakes from sleep, when coreaudiod has stopped the physical device's IO.
 let kSoundEnhancerPropertyReconnect: AudioObjectPropertySelector = 0x53457263 // 'SErc'
 
+// FourCC 'SEud'. The target physical output device's UID. AudioObjectIDs are
+// assigned per HAL connection, so the numeric ID is not meaningful inside the
+// driver's process; the UID is the stable key the driver re-resolves.
+let kSoundEnhancerPropertyOutputUID: AudioObjectPropertySelector = 0x53457564 // 'SEud'
+
 // Must match the C struct `SoundEnhancerConfig` in SoundEnhancerDriver.c:
 // all 32-bit fields, no padding.
 struct SEConfig: Equatable {
@@ -94,6 +99,19 @@ enum DriverLink {
         var cfValue = Unmanaged.passUnretained(data)
         let status = AudioObjectSetPropertyData(
             deviceID, &address, 0, nil, UInt32(MemoryLayout<Unmanaged<CFData>>.size), &cfValue)
+        return status == noErr
+    }
+
+    @discardableResult
+    static func writeOutputUID(_ uid: String, to deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kSoundEnhancerPropertyOutputUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let string = uid as CFString
+        var cfValue = Unmanaged.passUnretained(string)
+        let status = AudioObjectSetPropertyData(
+            deviceID, &address, 0, nil, UInt32(MemoryLayout<Unmanaged<CFString>>.size), &cfValue)
         return status == noErr
     }
 }

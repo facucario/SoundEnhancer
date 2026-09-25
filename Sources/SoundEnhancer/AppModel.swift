@@ -92,6 +92,7 @@ final class AppModel: ObservableObject {
     private var lastPushedConfig: SEConfig?
     private var levelTimer: Timer?
     private var wakeRetryCount = 0
+    private var devicePollTick = 0
     private var hasForcedInitialReconnect = false
     private var wakeObserver: NSObjectProtocol?
     private var willTerminateObserver: NSObjectProtocol?
@@ -174,6 +175,17 @@ final class AppModel: ObservableObject {
     private func updateLevels() {
         applySystemVolume()
         refreshLevels()
+
+        // The device-change listener is not always delivered after a monitor's
+        // USB-C/DisplayPort audio device is dropped during deep sleep, so the
+        // driver can be left pointing at a stale AudioDeviceID that no longer
+        // exists (AudioDeviceCreateIOProcID then fails with
+        // kAudioHardwareBadDeviceError). Re-sync on a slow cadence so a dead
+        // target is re-resolved and a re-appeared monitor is re-selected.
+        devicePollTick += 1
+        if devicePollTick % 4 == 0 {
+            syncDriver()
+        }
     }
 
     private func refreshLevels() {
@@ -405,8 +417,16 @@ final class AppModel: ObservableObject {
         }
 
         if currentTargetOutputID != outputID {
+            AudioLog.write("sync: output \(currentTargetOutputID.map(String.init) ?? "nil") -> \(outputID)")
             currentTargetOutputID = outputID
             AudioDeviceManager.setBufferFrameSize(virtual.id, frames: UInt32(bufferSize))
+
+            // Tell the driver the target's UID. AudioObjectIDs are per HAL
+            // connection, so the driver must re-resolve the UID against its own
+            // device list before binding the pass-through IO proc.
+            if let uid = outputDevices.first(where: { $0.id == outputID })?.uid {
+                DriverLink.writeOutputUID(uid, to: virtual.id)
+            }
         }
 
         pushConfig()
