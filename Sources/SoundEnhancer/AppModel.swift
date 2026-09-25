@@ -98,6 +98,7 @@ final class AppModel: ObservableObject {
     private var willTerminateObserver: NSObjectProtocol?
     private let selectedOutputKey = "selectedOutputDeviceID"
     private let selectedOutputUIDKey = "selectedOutputDeviceUID"
+    private let selectedOutputNameKey = "selectedOutputDeviceName"
     private let previousDefaultOutputKey = "previousDefaultOutputDeviceID"
     private var previousVolumeDb: Float = 0
     private var previousMute: Bool = false
@@ -114,12 +115,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // The selected output is remembered by UID so it survives the device being
-    // re-enumerated with a new AudioDeviceID (e.g. a DisplayPort/USB monitor
-    // after the system wakes from sleep).
+    // The selected output is remembered by UID (and name as a fallback) so it
+    // survives the device being re-enumerated with a new AudioDeviceID or even a
+    // changed UID (e.g. a DisplayPort/USB monitor after the system wakes).
     private var selectedOutputDeviceUID: String {
         get { UserDefaults.standard.string(forKey: selectedOutputUIDKey) ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: selectedOutputUIDKey) }
+    }
+
+    private var selectedOutputDeviceName: String {
+        get { UserDefaults.standard.string(forKey: selectedOutputNameKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: selectedOutputNameKey) }
     }
 
     var estimatedLatencyMs: Int {
@@ -217,8 +223,10 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.set(Int(selectedOutputDeviceID), forKey: selectedOutputKey)
         if selectedOutputDeviceID == 0 {
             selectedOutputDeviceUID = ""
+            selectedOutputDeviceName = ""
         } else if let device = outputDevices.first(where: { $0.id == selectedOutputDeviceID }) {
             selectedOutputDeviceUID = device.uid
+            selectedOutputDeviceName = device.name
         }
         currentTargetOutputID = 0
         syncDriver()
@@ -285,6 +293,14 @@ final class AppModel: ObservableObject {
 
     private func reconnectOutput() {
         syncDriver()
+
+        // On the first attempt after wake, make sure the virtual device is still
+        // the system default. coreaudiod can revert the default to the built-in
+        // speakers while the machine sleeps, which would bypass the enhancer.
+        if wakeRetryCount == 0 {
+            reassertVirtualAsDefault()
+        }
+
         // Force a full tear-down and re-bind of the driver's output IO proc for
         // the first few attempts. After that just keep re-syncing so a device
         // that re-appears (with a new ID) gets re-selected and re-bound.
@@ -304,6 +320,15 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func reassertVirtualAsDefault() {
+        guard let virtualID = currentVirtualID else { return }
+        let current = AudioDeviceManager.defaultOutputDeviceID()
+        if current != virtualID, current != 0 {
+            AudioDeviceManager.setDefaultOutputDevice(virtualID)
+            AudioLog.write("wake: restored default output \(current) -> \(virtualID)")
+        }
+    }
+
     // MARK: - Internals
 
     private func refreshDevices() {
@@ -312,16 +337,23 @@ final class AppModel: ObservableObject {
         if selectedOutputDeviceID != 0,
            let current = outputDevices.first(where: { $0.id == selectedOutputDeviceID }) {
             selectedOutputDeviceUID = current.uid
+            selectedOutputDeviceName = current.name
             return
         }
 
         // The selected device is gone (it may have been re-enumerated with a new
-        // AudioDeviceID after sleep, or briefly removed while the display's link
-        // was down). Re-resolve it by UID if we remember one; otherwise fall back
-        // to no selection so syncDriver picks a physical device.
+        // AudioDeviceID after sleep, and its UID may have changed too). Re-resolve
+        // it by UID first, then by name, so a monitor that reconnects on a
+        // different transport still gets re-selected instead of falling back to
+        // the built-in speakers.
         if !selectedOutputDeviceUID.isEmpty,
-           let reenumerated = outputDevices.first(where: { $0.uid == selectedOutputDeviceUID }) {
-            selectedOutputDeviceID = reenumerated.id
+           let byUID = outputDevices.first(where: { $0.uid == selectedOutputDeviceUID }) {
+            selectedOutputDeviceID = byUID.id
+            selectedOutputDeviceName = byUID.name
+        } else if !selectedOutputDeviceName.isEmpty,
+                  let byName = outputDevices.first(where: { $0.name == selectedOutputDeviceName }) {
+            selectedOutputDeviceID = byName.id
+            selectedOutputDeviceUID = byName.uid
         } else if selectedOutputDeviceID != 0 {
             selectedOutputDeviceID = 0
         }
