@@ -3,14 +3,6 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var model: AppModel
 
-    private var appVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
-    }
-
-    private var driverVersion: String {
-        DriverInstaller.driverVersion() ?? "Not installed"
-    }
-
     var body: some View {
         Form {
             Section {
@@ -126,11 +118,6 @@ struct SettingsView: View {
                 Text("Smaller buffers reduce latency but increase the chance of dropouts. 256 is a good default.")
                     .font(.caption)
                     .foregroundColor(.secondary)
-            }
-
-            Section("About") {
-                LabeledContent("App version", value: appVersion)
-                LabeledContent("Driver version", value: driverVersion)
             }
 
             Section("Routing") {
