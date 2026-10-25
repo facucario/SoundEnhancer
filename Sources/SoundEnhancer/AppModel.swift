@@ -93,6 +93,8 @@ final class AppModel: ObservableObject {
     private var levelTimer: Timer?
     private var wakeRetryCount = 0
     private var devicePollTick = 0
+    private var isVirtualDefault = false
+    private var hasCheckedActivation = false
     private var hasForcedInitialReconnect = false
     private var wakeObserver: NSObjectProtocol?
     private var willTerminateObserver: NSObjectProtocol?
@@ -156,6 +158,9 @@ final class AppModel: ObservableObject {
         AudioDeviceManager.addDeviceChangeListener { [weak self] in
             self?.devicesChanged()
         }
+        AudioDeviceManager.addDefaultOutputChangeListener { [weak self] in
+            self?.refreshActivation()
+        }
         // The block-based observers must be retained, otherwise the notification
         // center deallocates them and the wake handler never fires.
         willTerminateObserver = NotificationCenter.default.addObserver(
@@ -169,16 +174,54 @@ final class AppModel: ObservableObject {
             self?.handleWake()
         }
         syncDriver()
-        levelTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.updateLevels()
-        }
+        refreshActivation()
     }
 
     deinit {
         levelTimer?.invalidate()
     }
 
-    private func updateLevels() {
+    // The app only needs to do work while the SoundEnhancer virtual device is
+    // actually in the audio path (i.e. it is the system default output). When
+    // the user has routed audio elsewhere (internal speakers, headphones, etc.)
+    // the driver's IO is already idle, so we drop to a slow "are we active yet?"
+    // poll instead of the 0.5s level-meter / re-sync cadence.
+    private func refreshActivation() {
+        guard let virtualID = currentVirtualID, virtualID != 0 else {
+            setActive(false)
+            return
+        }
+        setActive(AudioDeviceManager.defaultOutputDeviceID() == virtualID)
+    }
+
+    private func setActive(_ active: Bool) {
+        let changed = (active != isVirtualDefault) || !hasCheckedActivation
+        hasCheckedActivation = true
+        guard changed else { return }
+
+        let wasActive = isVirtualDefault
+        isVirtualDefault = active
+        AudioLog.write("app \(active ? "active" : "idle")")
+
+        if active, !wasActive {
+            // The enhancer just came back into the path; re-resolve the target.
+            syncDriver()
+        }
+        scheduleTimer()
+    }
+
+    private func scheduleTimer() {
+        levelTimer?.invalidate()
+        let interval: TimeInterval = isVirtualDefault ? 0.5 : 3.0
+        levelTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.timerTick()
+        }
+    }
+
+    private func timerTick() {
+        refreshActivation()
+        guard isVirtualDefault else { return }
+
         applySystemVolume()
         refreshLevels()
 
