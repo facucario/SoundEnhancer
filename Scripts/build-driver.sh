@@ -28,6 +28,11 @@ clang -bundle \
 
 cp "$PLIST" "$BUNDLE/Contents/Info.plist"
 
+VERSION="$("$ROOT/Scripts/version.sh")"
+BUILD="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 0)"
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$BUNDLE/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "$BUILD" "$BUNDLE/Contents/Info.plist"
+
 IDENTITY="${CODE_SIGN_IDENTITY:--}"
 if [ "$IDENTITY" = "-" ]; then
     echo "Codesigning driver (ad-hoc)..."

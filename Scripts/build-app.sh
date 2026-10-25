@@ -20,6 +20,12 @@ cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp -R "$ROOT/SoundEnhancerDriver.driver" "$APP/Contents/Resources/SoundEnhancerDriver.driver"
 
+VERSION="$("$ROOT/Scripts/version.sh")"
+BUILD="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 0)"
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "$BUILD" "$APP/Contents/Info.plist"
+echo "Version: $VERSION (build $BUILD)"
+
 IDENTITY="${CODE_SIGN_IDENTITY:--}"
 ENTITLEMENTS="$ROOT/Scripts/SoundEnhancer.entitlements"
 if [ "$IDENTITY" = "-" ]; then

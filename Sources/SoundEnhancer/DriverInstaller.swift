@@ -21,13 +21,27 @@ enum DriverInstaller {
         FileManager.default.fileExists(atPath: installedPath)
     }
 
-    private static func version(at path: String) -> String? {
+    private static func infoValue(_ key: String, at path: String) -> String? {
         let plistPath = (path as NSString).appendingPathComponent("Contents/Info.plist")
         guard let data = FileManager.default.contents(atPath: plistPath),
               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
             return nil
         }
-        return plist["CFBundleVersion"] as? String
+        return plist[key] as? String
+    }
+
+    private static func version(at path: String) -> String? {
+        infoValue("CFBundleVersion", at: path)
+    }
+
+    /// Human-readable driver version, preferring the installed copy and falling
+    /// back to the bundled one.
+    static func driverVersion() -> String? {
+        if isInstalled() {
+            if let v = infoValue("CFBundleShortVersionString", at: installedPath) { return v }
+        }
+        guard let bundled = bundledURL() else { return nil }
+        return infoValue("CFBundleShortVersionString", at: bundled.path)
     }
 
     private static func binaryHash(at path: String) -> String? {

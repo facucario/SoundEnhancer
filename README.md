@@ -21,7 +21,16 @@ the app.
 - macOS 14.0 or later (Apple Silicon or Intel)
 - Xcode Command Line Tools (for `swift`, `clang`, `codesign`)
 
-## Build
+## Install
+
+Download the latest `.dmg` from the
+[Releases](https://github.com/facucario/SoundEnhancer/releases) page, open it,
+and drag `SoundEnhancer.app` to your Applications folder.
+
+On first launch the app prompts for admin permission to copy the driver to
+`/Library/Audio/Plug-Ins/HAL` and restart `coreaudiod`.
+
+## Build from source
 
 ```sh
 make app          # builds the app + driver (ad-hoc signed, for local use)
@@ -31,26 +40,7 @@ make test         # run the Swift tests
 ```
 
 The `app` target assembles `SoundEnhancer.app` in the repo root, embedding the
-driver in `Contents/Resources`. On first launch the app prompts for admin
-permission to copy the driver to `/Library/Audio/Plug-Ins/HAL` and restart
-`coreaudiod`.
-
-## Distribution
-
-Distributing outside your own machine requires a paid Apple Developer account, a
-Developer ID certificate, and notarization. See the signing/notarization targets:
-
-```sh
-CODE_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
-APPLE_ID="you@example.com" \
-APPLE_TEAM_ID="TEAMID" \
-APPLE_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx" \
-make dist
-```
-
-This produces a notarized, stapled `dist/SoundEnhancer-<version>.zip`. Because
-the app installs a system audio driver to `/Library`, it cannot be distributed
-through the Mac App Store.
+driver in `Contents/Resources`.
 
 ## Project layout
 

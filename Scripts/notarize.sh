@@ -4,7 +4,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/SoundEnhancer.app"
 DIST="$ROOT/dist"
-STAGING_ZIP="$DIST/SoundEnhancer-notarize.zip"
 
 : "${APPLE_ID:?APPLE_ID is required (your Apple ID email)}"
 : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required (your team ID)}"
@@ -15,25 +14,19 @@ if [ ! -d "$APP" ]; then
     exit 1
 fi
 
-VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")"
-mkdir -p "$DIST"
-rm -f "$STAGING_ZIP"
+"$ROOT/Scripts/make-dmg.sh"
 
-echo "Zipping app for notarization..."
-ditto -c -k --keepParent "$APP" "$STAGING_ZIP"
+VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")"
+DMG="$DIST/SoundEnhancer-$VERSION.dmg"
 
 echo "Submitting to Apple notary service..."
-xcrun notarytool submit "$STAGING_ZIP" \
+xcrun notarytool submit "$DMG" \
     --apple-id "$APPLE_ID" \
     --team-id "$APPLE_TEAM_ID" \
     --password "$APPLE_APP_PASSWORD" \
     --wait
 
 echo "Stapling notarization ticket..."
-xcrun stapler staple "$APP"
+xcrun stapler staple "$DMG"
 
-rm -f "$STAGING_ZIP"
-echo "Packaging final zip..."
-ditto -c -k --keepParent "$APP" "$DIST/SoundEnhancer-$VERSION.zip"
-
-echo "Done: $DIST/SoundEnhancer-$VERSION.zip"
+echo "Done: $DMG"
