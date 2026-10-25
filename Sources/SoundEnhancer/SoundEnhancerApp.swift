@@ -17,6 +17,11 @@ struct SoundEnhancerApp: App {
         Settings {
             SettingsView(model: model)
         }
+
+        Window("About Sound Enhancer", id: "about") {
+            AboutView()
+        }
+        .windowResizability(.contentSize)
     }
 }
 

@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MenuView: View {
     @ObservedObject var model: AppModel
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -46,6 +47,10 @@ struct MenuView: View {
 
             SettingsLink {
                 Text("Settings…")
+            }
+            Button("About Sound Enhancer…") {
+                openWindow(id: "about")
+                NSApp.activate(ignoringOtherApps: true)
             }
             Button("Quit") {
                 NSApp.terminate(nil)
