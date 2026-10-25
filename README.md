@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="Resources/AppIcon.png" alt="SoundEnhancer icon" width="128" />
+</p>
+
 # SoundEnhancer
 
 A macOS menu-bar app that adds real-time DSP to system audio through a native
@@ -29,6 +33,28 @@ and drag `SoundEnhancer.app` to your Applications folder.
 
 On first launch the app prompts for admin permission to copy the driver to
 `/Library/Audio/Plug-Ins/HAL` and restart `coreaudiod`.
+
+## Usage
+
+SoundEnhancer lives in the menu bar (waveform icon). Everything is controlled
+from there and from **Settings…**.
+
+1. **First run** — approve the admin prompt so the virtual audio driver can be
+   installed. The app automatically makes the SoundEnhancer device your default
+   output and routes it to your speakers/headphones, carrying over your volume.
+2. **Turn it on/off** — use the **Enhancer** toggle in the menu, or choose a
+   different **Output** device from the menu's picker.
+3. **Tune the sound** — open **Settings…**:
+   - *Intensity* (default) — a single slider for stereo width, bass and treble.
+   - *Advanced controls* — individual sliders for **Stereo Width**, **Bass**,
+     **Treble** and **Spatial Depth**.
+   - *Crosstalk Cancellation (XTC)* — preserves binaural cues over speakers;
+     pick a speaker setup or enter custom geometry.
+   - *Latency* — smaller buffers are snappier but can drop out; 256 is a good
+     default.
+4. **Bypass it** — set your regular output device back as the default in
+   System Settings → Sound (or disable the Enhancer toggle). Audio then flows
+   unprocessed.
 
 ## Build from source
 
