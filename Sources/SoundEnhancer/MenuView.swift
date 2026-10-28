@@ -52,6 +52,9 @@ struct MenuView: View {
                 openWindow(id: "about")
                 NSApp.activate(ignoringOtherApps: true)
             }
+            Button("Uninstall Sound Enhancer…") {
+                model.uninstall()
+            }
             Button("Quit") {
                 NSApp.terminate(nil)
             }
