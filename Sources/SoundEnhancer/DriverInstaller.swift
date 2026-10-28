@@ -92,4 +92,57 @@ enum DriverInstaller {
         installerLog.error("driver install failed (status \(task.terminationStatus))")
         return false
     }
+
+    /// Removes the driver from /Library/Audio/Plug-Ins/HAL and reloads coreaudiod.
+    /// Requires admin privileges. Returns false if nothing was removed or the
+    /// admin prompt was cancelled.
+    @discardableResult
+    static func uninstallDriver() -> Bool {
+        guard isInstalled() else {
+            installerLog.info("driver not installed, nothing to uninstall")
+            return true
+        }
+
+        let script = """
+        do shell script "rm -rf '\(installedPath)' && killall coreaudiod" with administrator privileges
+        """
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        task.arguments = ["-e", script]
+        task.launch()
+        task.waitUntilExit()
+
+        if task.terminationStatus == 0, !isInstalled() {
+            installerLog.info("driver uninstalled from \(self.installedPath, privacy: .public)")
+            return true
+        }
+        installerLog.error("driver uninstall failed (status \(task.terminationStatus))")
+        return false
+    }
+
+    /// Moves the running app bundle to the Trash. Finder handles the move, so it
+    /// prompts for authentication if the app lives in a protected location and
+    /// copes with the executable still being in use.
+    static func moveAppToTrash() {
+        let appURL = Bundle.main.bundleURL
+        guard appURL.pathExtension == "app" else {
+            installerLog.error("app bundle not found; skipping removal")
+            return
+        }
+        let path = appURL.path
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "tell application \"Finder\" to delete (POSIX file \"\(path)\")"
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        task.arguments = ["-e", script]
+        task.launch()
+        task.waitUntilExit()
+
+        if task.terminationStatus != 0 {
+            installerLog.error("failed to move app to Trash (status \(task.terminationStatus))")
+        }
+    }
 }

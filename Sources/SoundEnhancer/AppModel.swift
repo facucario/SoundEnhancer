@@ -307,6 +307,32 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func uninstall() {
+        let alert = NSAlert()
+        alert.messageText = "Uninstall Sound Enhancer?"
+        alert.informativeText = "This will remove the audio driver and move the Sound Enhancer app to the Trash."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Uninstall")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        restoreDefaultOutput()
+
+        guard DriverInstaller.uninstallDriver() else {
+            modelLog.error("driver uninstall failed or was cancelled")
+            let failed = NSAlert()
+            failed.messageText = "Could Not Uninstall"
+            failed.informativeText = "The audio driver could not be removed. Check your administrator password and try again."
+            failed.alertStyle = .warning
+            failed.runModal()
+            return
+        }
+
+        DriverInstaller.moveAppToTrash()
+        NSApp.terminate(nil)
+    }
+
     private func xtcGeometryValues() -> (separation: Double, distance: Double) {
         if xtcGeometry == .custom {
             return (customSeparation, customDistance)
